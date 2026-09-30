@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
     entry_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     wallet_id UUID REFERENCES wallets(wallet_id),
     statement_id UUID REFERENCES statements(statement_id),
-    entry_type VARCHAR(50) NOT NULL, -- CREDIT_ISSUANCE, SETTLEMENT_PAYMENT, PLATFORM_FEE
+    entry_type VARCHAR(50) NOT NULL, -- CREDIT_ISSUANCE, FEE_CREDIT_ISSUANCE, SETTLEMENT_PAYMENT, PLATFORM_FEE
     amount NUMERIC(12, 2) NOT NULL,
     balance_after NUMERIC(12, 2) NOT NULL,
     description TEXT,
@@ -60,6 +60,15 @@ BEGIN
             ADD CONSTRAINT settlements_statement_unique UNIQUE (statement_id);
     END IF;
 END $$;
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;
+ALTER TABLE statements ADD COLUMN IF NOT EXISTS platform_fee_rate NUMERIC(7, 6);
+ALTER TABLE statements ADD COLUMN IF NOT EXISTS platform_fee NUMERIC(12, 2);
+-- UTILITY (uploaded bill) or PLATFORM_SUBSCRIPTION (the monthly Necessify plan fee, billed as its own statement)
+ALTER TABLE statements ADD COLUMN IF NOT EXISTS statement_type VARCHAR(40) NOT NULL DEFAULT 'UTILITY';
+ALTER TABLE statements ADD COLUMN IF NOT EXISTS billing_month DATE;
+CREATE INDEX IF NOT EXISTS idx_statements_subscription_month ON statements(user_id, billing_month)
+    WHERE statement_type = 'PLATFORM_SUBSCRIPTION';
 
 CREATE INDEX IF NOT EXISTS idx_statements_user_id ON statements(user_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_entries_wallet_id ON ledger_entries(wallet_id, created_at);

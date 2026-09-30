@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Necessify</title>
+  <link rel="icon" href="emblem.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><img src="emblem.png" alt="" class="brand-mark">Necessify</div>
+    <div id="account" class="account" hidden>
+      <span id="account-email"></span>
+      <button id="sign-out" class="link-button" type="button">Sign out</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="sign-in" class="card narrow" hidden>
+      <img src="logo.jpg" alt="Necessify logo" class="hero-logo">
+      <h1>Pay your bills with Necessify</h1>
+      <p class="muted">Upload a utility or housing bill and it becomes credits that pay the provider in full. Providers never pay a fee. The Necessify plan is $75 a month for up to 5 companies, or $150 for more than 5.</p>
+      <form id="sign-in-form">
+        <label for="email">Email address</label>
+        <input id="email" name="email" type="email" required autocomplete="email" placeholder="you@example.com">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" required minlength="8" autocomplete="current-password" placeholder="At least 8 characters">
+        <button type="submit" class="primary" id="sign-in-button">Log in</button>
+      </form>
+      <p id="sign-in-error" class="error" role="alert"></p>
+      <p class="muted switch-mode">
+        <span id="mode-prompt">New to Necessify?</span>
+        <button type="button" id="mode-toggle" class="link-button">Create an account</button>
+      </p>
+    </section>
+
+    <section id="dashboard" hidden>
+      <div class="grid">
+        <div class="card wallet">
+          <h2>Your wallet</h2>
+          <div class="balance"><span id="balance">0.00</span> <span class="unit">credits</span></div>
+          <p class="muted">1 credit = $1.00</p>
+        </div>
+
+        <div class="card">
+          <h2>Upload a bill</h2>
+          <form id="upload-form">
+            <label class="dropzone" id="dropzone" for="bill-file">
+              <input id="bill-file" type="file" accept="image/png,image/jpeg,image/webp,image/tiff,image/bmp,image/gif,text/plain,application/json,.txt,.json" required>
+              <span id="file-label">Choose a photo or scan of your bill, or drag it here</span>
+            </label>
+            <button type="submit" class="primary" id="upload-button">Upload bill</button>
+          </form>
+          <div id="upload-result" role="status"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Your bills</h2>
+        <p id="bills-empty" class="muted">No bills yet. Upload one above to get started.</p>
+        <ul id="bills" class="bills"></ul>
+      </div>
+
+      <div class="card">
+        <h2>Activity</h2>
+        <p id="activity-empty" class="muted">No activity yet.</p>
+        <div class="table-scroll">
+          <table id="activity" class="activity" hidden>
+            <thead><tr><th>Date</th><th>Type</th><th>Details</th><th class="num">Amount</th><th class="num">Balance</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
