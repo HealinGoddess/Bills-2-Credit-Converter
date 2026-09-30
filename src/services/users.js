@@ -44,7 +44,30 @@ function createUserService({ pool }) {
     return { wallet, ledgerEntries: entries };
   }
 
-  return { createUser, getWallet };
+  async function findByEmail(email) {
+    if (typeof email !== 'string' || !EMAIL_PATTERN.test(email)) {
+      throw new ApiError(400, 'VALIDATION_ERROR', 'A valid email is required');
+    }
+    const { rows: [user] } = await pool.query(
+      'SELECT user_id, email, account_status, created_at FROM users WHERE email = $1',
+      [email.toLowerCase()],
+    );
+    if (!user) throw new ApiError(404, 'USER_NOT_FOUND', 'User not found');
+    return { user };
+  }
+
+  async function listStatements(userId) {
+    if (!isUuid(userId)) throw new ApiError(400, 'VALIDATION_ERROR', 'userId must be a UUID');
+    const { rows } = await pool.query(
+      `SELECT statement_id, payee_name, account_number_masked, gross_amount, due_date::text AS due_date,
+              verification_status, created_at
+       FROM statements WHERE user_id = $1 ORDER BY created_at DESC`,
+      [userId],
+    );
+    return { statements: rows };
+  }
+
+  return { createUser, getWallet, findByEmail, listStatements };
 }
 
 module.exports = { createUserService };

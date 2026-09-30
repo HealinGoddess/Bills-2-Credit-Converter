@@ -181,6 +181,25 @@ describe('Necessify ledger (Postgres + Mongo)', () => {
     )).rejects.toMatchObject({ code: '23514', constraint: 'settlements_zero_provider_fee' });
   });
 
+  test('users can be found by email and list their statements with current status', async () => {
+    const email = `Lookup-${crypto.randomUUID()}@Example.com`;
+    const created = await request(app).post('/api/v1/users').send({ email });
+    const userId = created.body.user.user_id;
+    const { body: { statement: paid } } = await ingest(userId, '40.00');
+    await ingest(userId, '5.00');
+    await request(app).post('/api/v1/payments/settle').send({ userId, statementId: paid.statement_id });
+
+    const found = await request(app).get(`/api/v1/users/by-email/${encodeURIComponent(email)}`);
+    expect(found.status).toBe(200);
+    expect(found.body.user.user_id).toBe(userId);
+
+    const res = await request(app).get(`/api/v1/users/${userId}/statements`);
+    expect(res.status).toBe(200);
+    expect(res.body.statements.map((s) => [s.gross_amount, s.verification_status])).toEqual([
+      ['5.00', 'pending'], ['40.00', 'settled'],
+    ]);
+  });
+
   test('settlement of an unknown statement returns 404', async () => {
     const userId = await createUser();
     const res = await request(app).post('/api/v1/payments/settle').send({ userId, statementId: crypto.randomUUID() });

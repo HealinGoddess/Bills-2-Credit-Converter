@@ -261,3 +261,45 @@ describe('error handling', () => {
     expect(missing.status).toBe(404);
   });
 });
+
+describe('user lookup endpoints', () => {
+  test('finds a user by email (case-insensitive) and 404s when missing', async () => {
+    const { app, pool } = buildApp((sql, params) => (params[0] === 'a@b.com'
+      ? { rows: [{ user_id: USER_ID, email: 'a@b.com', account_status: 'active' }] }
+      : { rows: [] }));
+
+    const found = await request(app).get('/api/v1/users/by-email/A@B.com');
+    expect(found.status).toBe(200);
+    expect(found.body.user.user_id).toBe(USER_ID);
+    expect(pool.find('WHERE email = $1')[0].params).toEqual(['a@b.com']);
+
+    const missing = await request(app).get('/api/v1/users/by-email/x@y.com');
+    expect(missing.status).toBe(404);
+
+    const invalid = await request(app).get('/api/v1/users/by-email/not-an-email');
+    expect(invalid.status).toBe(400);
+  });
+
+  test("lists a user's statements newest first", async () => {
+    const rows = [{ statement_id: STATEMENT_ID, payee_name: 'Water Co', verification_status: 'pending' }];
+    const { app, pool } = buildApp(() => ({ rows }));
+
+    const res = await request(app).get(`/api/v1/users/${USER_ID}/statements`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.statements).toEqual(rows);
+    const [q] = pool.find('FROM statements WHERE user_id = $1');
+    expect(q.sql).toContain('ORDER BY created_at DESC');
+    expect(q.params).toEqual([USER_ID]);
+  });
+});
+
+describe('web UI', () => {
+  test('serves the website at /', async () => {
+    const { app } = buildApp(() => undefined);
+    const res = await request(app).get('/');
+    expect(res.status).toBe(200);
+    expect(res.text).toContain('Necessify');
+    expect((await request(app).get('/app.js')).status).toBe(200);
+  });
+});
