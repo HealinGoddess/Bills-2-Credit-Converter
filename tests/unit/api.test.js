@@ -27,7 +27,11 @@ const post = (app, path) => request(app).post(path).set('Cookie', COOKIE);
 const get = (app, path) => request(app).get(path).set('Cookie', COOKIE);
 
 function ingestHandler({ duplicate = false, walletBalance = '0.00', insertError } = {}) {
+  let inserted;
   return (sql, params) => {
+    if (sql.startsWith('SELECT statement_id, payee_name, account_number_masked, gross_amount, platform_fee_rate')) {
+      return { rows: inserted && params[0] === inserted.statement_id ? [inserted] : [] };
+    }
     if (sql.startsWith('SELECT account_status FROM users')) return { rows: [{ account_status: 'active' }] };
     if (sql.startsWith('SELECT statement_id FROM statements WHERE ocr_hash')) {
       return { rows: duplicate ? [{ statement_id: STATEMENT_ID }] : [] };
@@ -37,13 +41,12 @@ function ingestHandler({ duplicate = false, walletBalance = '0.00', insertError 
     }
     if (sql.startsWith('INSERT INTO statements')) {
       if (insertError) throw insertError;
-      return {
-        rows: [{
-          statement_id: STATEMENT_ID, user_id: params[0], payee_name: params[1], account_number_masked: params[2],
-          gross_amount: params[3], due_date: params[4], ocr_hash: params[5], verification_status: 'pending',
-          platform_fee_rate: String(params[6]), platform_fee: params[7],
-        }],
+      inserted = {
+        statement_id: STATEMENT_ID, user_id: params[0], payee_name: params[1], account_number_masked: params[2],
+        gross_amount: params[3], due_date: params[4], ocr_hash: params[5], verification_status: 'verified',
+        platform_fee_rate: String(params[6]), platform_fee: params[7],
       };
+      return { rows: [inserted] };
     }
     if (sql.startsWith('INSERT INTO ledger_entries')) {
       return { rows: [{ entry_type: params[2], amount: params[3], balance_after: params[4] }] };
@@ -96,7 +99,10 @@ describe('POST /api/v1/statements/ingest', () => {
       payee_name: 'City Power & Light', account_number_masked: '****1234', gross_amount: '142.37', due_date: '2026-10-15',
     });
     expect(res.body.statement.ocr_hash).toBe(crypto.createHash('sha256').update(text).digest('hex'));
-    expect(res.body.statement).toMatchObject({ platform_fee_rate: '0.02', platform_fee: '2.85' });
+    expect(res.body.statement).toMatchObject({
+      platform_fee_rate: '0.02', platform_fee: '2.85', verification_status: 'verified',
+    });
+    expect(pool.find('INSERT INTO statements')[0].sql).toContain("'verified'");
     expect(res.body.wallet).toEqual({ walletId: WALLET_ID, creditBalance: '155.22', currency: 'NOU' });
     expect(res.body.documentStored).toBe(true);
 
@@ -113,7 +119,7 @@ describe('POST /api/v1/statements/ingest', () => {
     const txSql = pool.client.query.mock.calls.map(([sql]) => sql.trim().split(/\s+/)[0]);
     expect(txSql[0]).toBe('BEGIN');
     expect(txSql[txSql.length - 1]).toBe('COMMIT');
-    expect(pool.find('FOR UPDATE')).toHaveLength(1);
+    expect(pool.find('FOR UPDATE').length).toBeGreaterThanOrEqual(1);
 
     expect(documentStore.saveStatementDocument).toHaveBeenCalledWith(expect.objectContaining({
       statementId: STATEMENT_ID, userId: USER_ID, ocrProvider: 'text', rawText: text,

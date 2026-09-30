@@ -115,7 +115,7 @@ describe('Necessify ledger (Postgres + Mongo)', () => {
     expect(res.body.documentStored).toBe(true);
     const { statement } = res.body;
     expect(statement).toMatchObject({
-      gross_amount: '142.37', verification_status: 'pending', due_date: '2026-10-15',
+      gross_amount: '142.37', verification_status: 'verified', due_date: '2026-10-15',
       platform_fee_rate: '0.020000', platform_fee: '2.85',
     });
 
@@ -221,7 +221,7 @@ describe('Necessify ledger (Postgres + Mongo)', () => {
     const { rows } = await pool.query('SELECT count(*)::int AS n FROM settlements WHERE statement_id = $1', [statement.statement_id]);
     expect(rows[0].n).toBe(0);
     const { rows: [s] } = await pool.query('SELECT verification_status FROM statements WHERE statement_id = $1', [statement.statement_id]);
-    expect(s.verification_status).toBe('pending');
+    expect(s.verification_status).toBe('verified');
   });
 
   test('concurrent settle requests settle once and never overdraw', async () => {
@@ -256,9 +256,50 @@ describe('Necessify ledger (Postgres + Mongo)', () => {
     const res = await user.agent.get(`/api/v1/users/${user.userId}/statements`);
     expect(res.status).toBe(200);
     expect(res.body.statements.map((s) => [s.gross_amount, s.platform_fee, s.verification_status])).toEqual([
-      ['5.00', '0.10', 'pending'], ['40.00', '0.80', 'settled'],
+      ['5.00', '0.10', 'verified'], ['40.00', '0.80', 'settled'],
     ]);
     expect((await walletOf(user)).wallet.credit_balance).toBe('5.10');
+  });
+
+  test('ledger invariants hold across many bills: wallet = sum of entries, provider gets gross, fee only from wallet', async () => {
+    const user = await createUser();
+    await addExistingCredits(user.userId, '3.00');
+    await pool.query(
+      `INSERT INTO ledger_entries (wallet_id, entry_type, amount, balance_after, description)
+       SELECT wallet_id, 'CREDIT_ISSUANCE', 3.00, 3.00, 'opening balance' FROM wallets WHERE user_id = $1`,
+      [user.userId],
+    );
+    const amounts = ['150.00', '0.01', '33.33', '1234.56', '99.99'];
+    const statements = [];
+    for (const amount of amounts) {
+      const res = await ingest(user.agent, amount);
+      expect(res.status).toBe(201);
+      statements.push(res.body.statement);
+    }
+    for (const st of statements.slice(0, 4)) {
+      expect((await settle(user.agent, st.statement_id)).status).toBe(200);
+    }
+
+    const { wallet } = await walletOf(user);
+    const { rows: [sum] } = await pool.query(
+      'SELECT sum(amount)::numeric(12,2)::text AS total FROM ledger_entries WHERE wallet_id = $1', [wallet.wallet_id],
+    );
+    expect(sum.total).toBe(wallet.credit_balance);
+    expect(wallet.credit_balance).toBe('104.99');
+
+    const { rows: outflows } = await pool.query(
+      `SELECT s.gross_amount, st.remittance_amount, st.fee_deducted_from_provider, s.platform_fee,
+              (SELECT -sum(amount) FROM ledger_entries l WHERE l.statement_id = s.statement_id
+                 AND l.entry_type = 'PLATFORM_FEE')::numeric(12,2)::text AS fee_debited
+       FROM settlements st JOIN statements s USING (statement_id) WHERE s.user_id = $1`,
+      [user.userId],
+    );
+    expect(outflows).toHaveLength(4);
+    for (const row of outflows) {
+      expect(row.remittance_amount).toBe(row.gross_amount);
+      expect(row.fee_deducted_from_provider).toBe('0.00');
+      expect(row.fee_debited).toBe(row.platform_fee);
+    }
   });
 
   test('settlement of an unknown statement returns 404', async () => {
