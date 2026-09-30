@@ -7,9 +7,35 @@ const { isUuid } = require('../lib/validate');
 const DEFAULT_PLATFORM_FEE_RATE = 0.02;
 const PROVIDER_FEE = '0.00';
 
-function computeSettlement(grossAmount, platformFeeRate) {
+function formatPercent(rate) {
+  return `${Number((rate * 100).toFixed(4))}%`;
+}
+
+function parsePlatformFeeRate(value) {
+  if (value === undefined || value === '') return DEFAULT_PLATFORM_FEE_RATE;
+  const rate = Number(value);
+  if (!Number.isFinite(rate) || rate < 0 || rate > 1) {
+    throw new Error(`PLATFORM_FEE_RATE must be a number between 0 and 1, got "${value}"`);
+  }
+  return rate;
+}
+
+// Statements ingested before fees were recorded fall back to the configured rate.
+function resolvePlatformFee(statement, platformFeeRate) {
+  if (statement.platform_fee !== null && statement.platform_fee !== undefined) {
+    return { rate: Number(statement.platform_fee_rate), amount: statement.platform_fee };
+  }
+  return {
+    rate: platformFeeRate,
+    amount: fromCents(percentOfCents(toCents(statement.gross_amount), platformFeeRate)),
+  };
+}
+
+function computeSettlement(grossAmount, platformFeeRate, platformFee) {
   const fullBillCents = toCents(grossAmount);
-  const beneficiaryFeeCents = percentOfCents(fullBillCents, platformFeeRate);
+  const beneficiaryFeeCents = platformFee === undefined
+    ? percentOfCents(fullBillCents, platformFeeRate)
+    : toCents(platformFee);
   return {
     fullBillCents,
     beneficiaryFeeCents,
@@ -35,7 +61,9 @@ async function lockWallet(client, userId) {
   return rows[0];
 }
 
-function createLedgerService({ pool, ocr, documentStore, logger = console }) {
+function createLedgerService({
+  pool, ocr, documentStore, platformFeeRate = DEFAULT_PLATFORM_FEE_RATE, logger = console,
+}) {
   const tx = (fn) => withTransaction(fn, pool);
 
   async function assertActiveUser(userId) {
@@ -71,6 +99,7 @@ function createLedgerService({ pool, ocr, documentStore, logger = console }) {
     const ocrResult = await ocr.extract({ buffer, mimeType });
     const { payeeName, accountNumberMasked, grossAmount, dueDate } = ocrResult.fields;
     const grossCents = toCents(grossAmount);
+    const feeCents = percentOfCents(grossCents, platformFeeRate);
 
     let result;
     try {
@@ -78,31 +107,43 @@ function createLedgerService({ pool, ocr, documentStore, logger = console }) {
         const wallet = await lockWallet(client, userId);
 
         const { rows: [statement] } = await client.query(
-          `INSERT INTO statements (user_id, payee_name, account_number_masked, gross_amount, due_date, ocr_hash)
-           VALUES ($1, $2, $3, $4, $5, $6)
+          `INSERT INTO statements (user_id, payee_name, account_number_masked, gross_amount, due_date, ocr_hash,
+                                   platform_fee_rate, platform_fee)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
            RETURNING statement_id, user_id, payee_name, account_number_masked, gross_amount, due_date::text AS due_date,
-                     ocr_hash, verification_status, created_at`,
-          [userId, payeeName, accountNumberMasked, fromCents(grossCents), dueDate, ocrHash],
+                     ocr_hash, verification_status, platform_fee_rate, platform_fee, created_at`,
+          [userId, payeeName, accountNumberMasked, fromCents(grossCents), dueDate, ocrHash,
+            platformFeeRate, fromCents(feeCents)],
         );
 
-        const newBalance = fromCents(toCents(wallet.credit_balance) + grossCents);
+        const startCents = toCents(wallet.credit_balance);
+        const afterIssuance = fromCents(startCents + grossCents);
+        const newBalance = fromCents(startCents + grossCents + feeCents);
         await client.query(
           'UPDATE wallets SET credit_balance = $1, updated_at = CURRENT_TIMESTAMP WHERE wallet_id = $2',
           [newBalance, wallet.wallet_id],
         );
 
-        const { rows: [ledgerEntry] } = await client.query(
-          `INSERT INTO ledger_entries (wallet_id, statement_id, entry_type, amount, balance_after, description, created_at)
-           VALUES ($1, $2, 'CREDIT_ISSUANCE', $3, $4, $5, clock_timestamp())
-           RETURNING entry_id, entry_type, amount, balance_after, description, created_at`,
-          [wallet.wallet_id, statement.statement_id, fromCents(grossCents), newBalance,
-            `Credit issuance for ${payeeName} statement ${accountNumberMasked}`],
-        );
+        const insertEntry = `INSERT INTO ledger_entries (wallet_id, statement_id, entry_type, amount, balance_after, description, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, clock_timestamp())
+           RETURNING entry_id, entry_type, amount, balance_after, description, created_at`;
+        const { rows: [ledgerEntry] } = await client.query(insertEntry, [
+          wallet.wallet_id, statement.statement_id, 'CREDIT_ISSUANCE', fromCents(grossCents), afterIssuance,
+          `Credit issuance for ${payeeName} statement ${accountNumberMasked}`,
+        ]);
+        const ledgerEntries = [ledgerEntry];
+        if (feeCents > 0) {
+          const { rows: [feeEntry] } = await client.query(insertEntry, [
+            wallet.wallet_id, statement.statement_id, 'FEE_CREDIT_ISSUANCE', fromCents(feeCents), newBalance,
+            `Credits to cover the ${formatPercent(platformFeeRate)} platform fee for ${payeeName}`,
+          ]);
+          ledgerEntries.push(feeEntry);
+        }
 
         return {
           statement,
           wallet: { walletId: wallet.wallet_id, creditBalance: newBalance, currency: wallet.currency },
-          ledgerEntry,
+          ledgerEntries,
         };
       });
     } catch (err) {
@@ -126,24 +167,24 @@ function createLedgerService({ pool, ocr, documentStore, logger = console }) {
       (store) => store.audit('STATEMENT_INGESTED', {
         userId,
         statementId,
-        details: { grossAmount: result.statement.gross_amount, balanceAfter: result.wallet.creditBalance },
+        details: {
+          grossAmount: result.statement.gross_amount,
+          platformFee: result.statement.platform_fee,
+          balanceAfter: result.wallet.creditBalance,
+        },
       }),
     ]);
 
     return { ...result, documentStored };
   }
 
-  async function settleStatement({ userId, statementId, platformFeeRate = DEFAULT_PLATFORM_FEE_RATE }) {
+  async function settleStatement({ userId, statementId }) {
     if (!isUuid(userId)) throw new ApiError(400, 'VALIDATION_ERROR', 'userId must be a UUID');
     if (!isUuid(statementId)) throw new ApiError(400, 'VALIDATION_ERROR', 'statementId must be a UUID');
-    if (typeof platformFeeRate !== 'number' || !Number.isFinite(platformFeeRate)
-      || platformFeeRate < 0 || platformFeeRate > 1) {
-      throw new ApiError(400, 'VALIDATION_ERROR', 'platformFeeRate must be a number between 0 and 1');
-    }
 
     const result = await tx(async (client) => {
       const { rows: [statement] } = await client.query(
-        `SELECT statement_id, user_id, payee_name, gross_amount, verification_status
+        `SELECT statement_id, user_id, payee_name, gross_amount, verification_status, platform_fee_rate, platform_fee
          FROM statements WHERE statement_id = $1 FOR UPDATE`,
         [statementId],
       );
@@ -160,7 +201,8 @@ function createLedgerService({ pool, ocr, documentStore, logger = console }) {
       );
       if (!wallet) throw new ApiError(404, 'WALLET_NOT_FOUND', 'Wallet not found');
 
-      const calc = computeSettlement(statement.gross_amount, platformFeeRate);
+      const fee = resolvePlatformFee(statement, platformFeeRate);
+      const calc = computeSettlement(statement.gross_amount, fee.rate, fee.amount);
       const balanceCents = toCents(wallet.credit_balance);
       if (balanceCents < calc.totalCreditsRequiredCents) {
         throw new ApiError(400, 'INSUFFICIENT_CREDITS', 'Wallet credit balance is insufficient for this settlement', {
@@ -186,7 +228,7 @@ function createLedgerService({ pool, ocr, documentStore, logger = console }) {
       ]);
       await client.query(insertEntry, [
         wallet.wallet_id, statementId, 'PLATFORM_FEE', fromCents(-calc.beneficiaryFeeCents), afterFee,
-        `Beneficiary platform fee at rate ${platformFeeRate}`,
+        `Beneficiary platform fee at rate ${fee.rate}`,
       ]);
 
       const { rows: [settlement] } = await client.query(
@@ -203,7 +245,7 @@ function createLedgerService({ pool, ocr, documentStore, logger = console }) {
         settlement,
         breakdown: {
           fullBillAmount: fromCents(calc.fullBillCents),
-          platformFeeRate,
+          platformFeeRate: fee.rate,
           beneficiaryFee: fromCents(calc.beneficiaryFeeCents),
           totalCreditsDeducted: fromCents(calc.totalCreditsRequiredCents),
           providerReceives: fromCents(calc.fullBillCents),
@@ -224,4 +266,6 @@ function createLedgerService({ pool, ocr, documentStore, logger = console }) {
   return { ingestStatement, settleStatement };
 }
 
-module.exports = { createLedgerService, computeSettlement, DEFAULT_PLATFORM_FEE_RATE };
+module.exports = {
+  createLedgerService, computeSettlement, parsePlatformFeeRate, resolvePlatformFee, DEFAULT_PLATFORM_FEE_RATE,
+};

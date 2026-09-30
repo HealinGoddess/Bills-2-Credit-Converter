@@ -35,6 +35,8 @@ services:
       DATABASE_URL: postgres://necessify:necessify@postgres:5432/necessify
       MONGO_URL: mongodb://mongo:27017/necessify
       OCR_CACHE_PATH: /tmp
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      PLATFORM_FEE_RATE: ${PLATFORM_FEE_RATE:-0.02}
     ports:
       - "3000:3000"
     depends_on:

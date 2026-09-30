@@ -1,11 +1,10 @@
 (() => {
   const API = '/api/v1';
-  const FEE_PERCENT = 2;
   const MAX_FILE_BYTES = 10 * 1024 * 1024;
-  const STORAGE_KEY = 'necessify.user';
 
   const $ = (id) => document.getElementById(id);
   let currentUser = null;
+  let mode = 'login';
 
   function el(tag, attrs = {}, children = []) {
     const node = document.createElement(tag);
@@ -46,6 +45,9 @@
       ...options,
     });
     const body = await res.json().catch(() => ({}));
+    if (res.status === 401 && body.error?.code === 'UNAUTHENTICATED' && currentUser) {
+      signedOut();
+    }
     if (!res.ok) {
       const error = new Error(body.error?.message || `Request failed (${res.status})`);
       error.code = body.error?.code;
@@ -57,6 +59,14 @@
 
   function friendlyError(err) {
     switch (err.code) {
+      case 'INVALID_CREDENTIALS':
+        return 'Email or password is incorrect.';
+      case 'EMAIL_EXISTS':
+        return 'An account with this email already exists. Log in instead.';
+      case 'TOO_MANY_ATTEMPTS':
+        return 'Too many failed attempts. Please wait a few minutes and try again.';
+      case 'UNAUTHENTICATED':
+        return 'Please log in again.';
       case 'DUPLICATE_STATEMENT':
         return 'This bill has already been uploaded.';
       case 'INSUFFICIENT_CREDITS':
@@ -87,15 +97,29 @@
     if (signedIn) $('account-email').textContent = currentUser.email;
   }
 
-  async function signIn(email) {
-    try {
-      const { user } = await api(`/users/by-email/${encodeURIComponent(email)}`);
-      return user;
-    } catch (err) {
-      if (err.code !== 'USER_NOT_FOUND') throw err;
-      const { user } = await api('/users', { method: 'POST', body: JSON.stringify({ email }) });
-      return user;
-    }
+  function setMode(next) {
+    mode = next;
+    const register = mode === 'register';
+    $('sign-in-button').textContent = register ? 'Create account' : 'Log in';
+    $('mode-prompt').textContent = register ? 'Already have an account?' : 'New to Necessify?';
+    $('mode-toggle').textContent = register ? 'Log in' : 'Create an account';
+    $('password').autocomplete = register ? 'new-password' : 'current-password';
+    $('sign-in-error').textContent = '';
+  }
+
+  async function signIn(email, password) {
+    const { user } = await api(mode === 'register' ? '/auth/register' : '/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    });
+    return user;
+  }
+
+  function signedOut() {
+    currentUser = null;
+    $('upload-result').replaceChildren();
+    $('sign-in-form').reset();
+    showView(false);
   }
 
   function renderWallet(wallet, entries) {
@@ -104,7 +128,12 @@
     tbody.replaceChildren();
     $('activity').hidden = entries.length === 0;
     $('activity-empty').hidden = entries.length > 0;
-    const labels = { CREDIT_ISSUANCE: 'Credits added', SETTLEMENT_PAYMENT: 'Bill paid', PLATFORM_FEE: 'Platform fee' };
+    const labels = {
+      CREDIT_ISSUANCE: 'Bill credits added',
+      FEE_CREDIT_ISSUANCE: 'Fee credits added',
+      SETTLEMENT_PAYMENT: 'Bill paid',
+      PLATFORM_FEE: 'Platform fee',
+    };
     entries.forEach((entry) => {
       const cents = toCents(entry.amount);
       tbody.append(el('tr', {}, [
@@ -119,8 +148,9 @@
 
   function paymentBreakdown(statement) {
     const billCents = toCents(statement.gross_amount);
-    const feeCents = Math.floor((billCents * FEE_PERCENT + 50) / 100);
-    return { billCents, feeCents, totalCents: billCents + feeCents };
+    const feeCents = toCents(statement.platform_fee);
+    const feePercent = Number((Number(statement.platform_fee_rate) * 100).toFixed(4));
+    return { billCents, feeCents, feePercent, totalCents: billCents + feeCents };
   }
 
   function renderBills(statements) {
@@ -158,13 +188,13 @@
   }
 
   function renderConfirm(statement, message, onCancel) {
-    const { billCents, feeCents, totalCents } = paymentBreakdown(statement);
+    const { billCents, feeCents, feePercent, totalCents } = paymentBreakdown(statement);
     const confirmButton = el('button', { className: 'primary', type: 'button', text: `Pay ${money(totalCents)}` });
     const cancelButton = el('button', { className: 'secondary', type: 'button', text: 'Cancel' });
     const panel = el('div', { className: 'confirm' }, [
       el('table', {}, [
         el('tr', {}, [el('td', { text: `${statement.payee_name} receives (100%, $0 fee to them)` }), el('td', { className: 'num', text: money(billCents) })]),
-        el('tr', {}, [el('td', { text: `Necessify platform fee (${FEE_PERCENT}%)` }), el('td', { className: 'num', text: money(feeCents) })]),
+        el('tr', {}, [el('td', { text: `Necessify platform fee (${feePercent}%)` }), el('td', { className: 'num', text: money(feeCents) })]),
         el('tr', { className: 'total' }, [el('td', { text: 'Total from your wallet' }), el('td', { className: 'num', text: money(totalCents) })]),
       ]),
       el('div', { className: 'buttons' }, [confirmButton, cancelButton]),
@@ -183,7 +213,7 @@
       try {
         await api('/payments/settle', {
           method: 'POST',
-          body: JSON.stringify({ userId: currentUser.user_id, statementId: statement.statement_id }),
+          body: JSON.stringify({ statementId: statement.statement_id }),
         });
         await refresh();
       } catch (err) {
@@ -240,10 +270,13 @@
       const fileBase64 = await readFileAsBase64(file);
       const { statement, wallet } = await api('/statements/ingest', {
         method: 'POST',
-        body: JSON.stringify({ userId: currentUser.user_id, fileBase64, mimeType: mimeTypeFor(file) }),
+        body: JSON.stringify({ fileBase64, mimeType: mimeTypeFor(file) }),
       });
+      const billCents = toCents(statement.gross_amount);
+      const feeCents = toCents(statement.platform_fee);
       showUploadResult(true, [
-        el('strong', { text: `${money(toCents(statement.gross_amount))} in credits added to your wallet.` }),
+        el('strong', { text: `${money(billCents + feeCents)} in credits added to your wallet.` }),
+        el('p', { className: 'muted', text: `${money(billCents)} for the bill plus ${money(feeCents)} to cover the platform fee, so this bill can be paid in full.` }),
         el('dl', {}, [
           el('dt', { text: 'From' }), el('dd', { text: statement.payee_name }),
           el('dt', { text: 'Account' }), el('dd', { text: statement.account_number_masked }),
@@ -284,7 +317,6 @@
 
   async function enterDashboard(user) {
     currentUser = user;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(user));
     showView(true);
     await refresh();
   }
@@ -296,10 +328,10 @@
     $('sign-in-form').addEventListener('submit', async (event) => {
       event.preventDefault();
       $('sign-in-error').textContent = '';
-      const button = event.submitter;
+      const button = $('sign-in-button');
       button.disabled = true;
       try {
-        await enterDashboard(await signIn($('email').value.trim()));
+        await enterDashboard(await signIn($('email').value.trim(), $('password').value));
       } catch (err) {
         $('sign-in-error').textContent = friendlyError(err);
       } finally {
@@ -307,22 +339,16 @@
       }
     });
 
-    $('sign-out').addEventListener('click', () => {
-      localStorage.removeItem(STORAGE_KEY);
-      currentUser = null;
-      $('upload-result').replaceChildren();
-      showView(false);
+    $('mode-toggle').addEventListener('click', () => setMode(mode === 'login' ? 'register' : 'login'));
+
+    $('sign-out').addEventListener('click', async () => {
+      await api('/auth/logout', { method: 'POST' }).catch(() => {});
+      signedOut();
     });
 
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      enterDashboard(JSON.parse(saved)).catch(() => {
-        localStorage.removeItem(STORAGE_KEY);
-        showView(false);
-      });
-    } else {
-      showView(false);
-    }
+    api('/auth/me')
+      .then(({ user }) => enterDashboard(user))
+      .catch(() => signedOut());
   }
 
   init();

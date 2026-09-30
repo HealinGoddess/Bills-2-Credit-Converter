@@ -70,6 +70,7 @@ main { max-width: 960px; margin: 24px auto; padding: 0 16px; }
 
 .narrow { max-width: 460px; margin: 32px auto; text-align: center; }
 .narrow form, .narrow .error { text-align: left; }
+.switch-mode { margin-top: 8px; }
 .hero-logo { display: block; width: 180px; max-width: 60%; margin: 0 auto 16px; border-radius: 10px; }
 .grid { display: grid; grid-template-columns: 1fr 1.6fr; gap: 20px; }
 .grid .card { margin-bottom: 20px; }
@@ -81,7 +82,7 @@ h2 { font-size: 1.1rem; margin: 0 0 12px; color: var(--gold); }
 
 label { display: block; font-weight: 600; margin-bottom: 6px; }
 
-input[type="email"] {
+input[type="email"], input[type="password"] {
   width: 100%;
   padding: 10px 12px;
   font-size: 1rem;
@@ -91,7 +92,7 @@ input[type="email"] {
   border-radius: 8px;
   margin-bottom: 12px;
 }
-input[type="email"]:focus { outline: 2px solid var(--gold); outline-offset: 1px; }
+input[type="email"]:focus, input[type="password"]:focus { outline: 2px solid var(--gold); outline-offset: 1px; }
 
 button { font: inherit; cursor: pointer; }
 button:disabled { opacity: 0.6; cursor: wait; }
