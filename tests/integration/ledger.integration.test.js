@@ -100,18 +100,18 @@ describe('accounts and log-in (Postgres)', () => {
     expect((await bob.agent.get(`/api/v1/users/${alice.userId}/statements`)).status).toBe(403);
     expect((await settle(bob.agent, statement.statement_id)).status).toBe(404);
     expect((await settle(bob.agent, statement.statement_id, { userId: alice.userId })).status).toBe(403);
-    expect((await walletOf(alice)).wallet.credit_balance).toBe('12.24');
+    expect((await walletOf(alice)).wallet.credit_balance).toBe('12.00');
   });
 });
 
 describe('Necessify ledger (Postgres + Mongo)', () => {
-  test('ingest mints the bill plus the 2% fee, writes the ledger, and stores the OCR document', async () => {
+  test('ingest mints credits dollar for dollar, records the 2% fee, writes the ledger, and stores the OCR document', async () => {
     const user = await createUser();
 
     const res = await ingest(user.agent, '142.37');
 
     expect(res.status).toBe(201);
-    expect(res.body.wallet.creditBalance).toBe('145.22');
+    expect(res.body.wallet.creditBalance).toBe('142.37');
     expect(res.body.documentStored).toBe(true);
     const { statement } = res.body;
     expect(statement).toMatchObject({
@@ -120,9 +120,8 @@ describe('Necessify ledger (Postgres + Mongo)', () => {
     });
 
     const { wallet, ledgerEntries } = await walletOf(user);
-    expect(wallet.credit_balance).toBe('145.22');
+    expect(wallet.credit_balance).toBe('142.37');
     expect(ledgerEntries.map((e) => [e.entry_type, e.amount, e.balance_after])).toEqual([
-      ['FEE_CREDIT_ISSUANCE', '2.85', '145.22'],
       ['CREDIT_ISSUANCE', '142.37', '142.37'],
     ]);
 
@@ -145,7 +144,7 @@ describe('Necessify ledger (Postgres + Mongo)', () => {
     expect(again.status).toBe(400);
     expect(again.body.error.code).toBe('DUPLICATE_STATEMENT');
     expect(otherUser.status).toBe(400);
-    expect((await walletOf(user)).wallet.credit_balance).toBe('76.50');
+    expect((await walletOf(user)).wallet.credit_balance).toBe('75.00');
     expect((await walletOf(other)).wallet.credit_balance).toBe('0.00');
   });
 
@@ -159,10 +158,21 @@ describe('Necessify ledger (Postgres + Mongo)', () => {
 
     expect(results.filter((r) => r.status === 201)).toHaveLength(1);
     expect(results.filter((r) => r.status === 400)).toHaveLength(4);
-    expect((await walletOf(user)).wallet.credit_balance).toBe('20.40');
+    expect((await walletOf(user)).wallet.credit_balance).toBe('20.00');
   });
 
-  test('a single uploaded bill pays itself: provider gets 100%, fee comes from the bill credits, wallet returns to where it was', async () => {
+  test('a single $150 bill alone cannot cover its $3 fee', async () => {
+    const user = await createUser();
+    const { body: { statement, wallet } } = await ingest(user.agent, '150.00');
+    expect(wallet.creditBalance).toBe('150.00');
+
+    const res = await settle(user.agent, statement.statement_id);
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatchObject({ code: 'INSUFFICIENT_CREDITS', details: { required: '153.00', shortfall: '3.00' } });
+  });
+
+  test('settling pays the provider 100% and takes the fee from existing wallet credits', async () => {
     const user = await createUser();
     await addExistingCredits(user.userId, '10.00');
     const { body: { statement } } = await ingest(user.agent, '142.37');
@@ -174,7 +184,7 @@ describe('Necessify ledger (Postgres + Mongo)', () => {
       fullBillAmount: '142.37', platformFeeRate: 0.02, beneficiaryFee: '2.85', totalCreditsDeducted: '145.22',
       providerReceives: '142.37', providerFee: '0.00', providerPayoutPercent: 100,
     });
-    expect(res.body.wallet.creditBalance).toBe('10.00');
+    expect(res.body.wallet.creditBalance).toBe('7.15');
 
     const { rows: [settlement] } = await pool.query(
       'SELECT remittance_amount, fee_deducted_from_provider, payment_channel, disbursement_status FROM settlements WHERE statement_id = $1',
@@ -185,11 +195,10 @@ describe('Necessify ledger (Postgres + Mongo)', () => {
     });
 
     const { wallet, ledgerEntries } = await walletOf(user);
-    expect(wallet.credit_balance).toBe('10.00');
+    expect(wallet.credit_balance).toBe('7.15');
     expect(ledgerEntries.map((e) => [e.entry_type, e.amount, e.balance_after])).toEqual([
-      ['PLATFORM_FEE', '-2.85', '10.00'],
-      ['SETTLEMENT_PAYMENT', '-142.37', '12.85'],
-      ['FEE_CREDIT_ISSUANCE', '2.85', '155.22'],
+      ['PLATFORM_FEE', '-2.85', '7.15'],
+      ['SETTLEMENT_PAYMENT', '-142.37', '10.00'],
       ['CREDIT_ISSUANCE', '142.37', '152.37'],
     ]);
 
@@ -200,13 +209,14 @@ describe('Necessify ledger (Postgres + Mongo)', () => {
 
   test('a client cannot lower or remove the fee', async () => {
     const user = await createUser();
+    await addExistingCredits(user.userId, '5.00');
     const { body: { statement } } = await ingest(user.agent, '100.00');
 
     const res = await settle(user.agent, statement.statement_id, { platformFeeRate: 0 });
 
     expect(res.status).toBe(200);
     expect(res.body.breakdown).toMatchObject({ platformFeeRate: 0.02, beneficiaryFee: '2.00', providerFee: '0.00' });
-    expect(res.body.wallet.creditBalance).toBe('0.00');
+    expect(res.body.wallet.creditBalance).toBe('3.00');
   });
 
   test('settlement with insufficient credits is rejected and leaves no trace', async () => {
@@ -233,7 +243,7 @@ describe('Necessify ledger (Postgres + Mongo)', () => {
 
     expect(results.filter((r) => r.status === 200)).toHaveLength(1);
     expect(results.filter((r) => r.status === 409)).toHaveLength(3);
-    expect((await walletOf(user)).wallet.credit_balance).toBe('7.00');
+    expect((await walletOf(user)).wallet.credit_balance).toBe('6.00');
   });
 
   test('the database itself refuses any settlement with a nonzero provider fee', async () => {
@@ -258,7 +268,7 @@ describe('Necessify ledger (Postgres + Mongo)', () => {
     expect(res.body.statements.map((s) => [s.gross_amount, s.platform_fee, s.verification_status])).toEqual([
       ['5.00', '0.10', 'verified'], ['40.00', '0.80', 'settled'],
     ]);
-    expect((await walletOf(user)).wallet.credit_balance).toBe('5.10');
+    expect((await walletOf(user)).wallet.credit_balance).toBe('4.20');
   });
 
   test('ledger invariants hold across many bills: wallet = sum of entries, provider gets gross, fee only from wallet', async () => {
@@ -285,7 +295,7 @@ describe('Necessify ledger (Postgres + Mongo)', () => {
       'SELECT sum(amount)::numeric(12,2)::text AS total FROM ledger_entries WHERE wallet_id = $1', [wallet.wallet_id],
     );
     expect(sum.total).toBe(wallet.credit_balance);
-    expect(wallet.credit_balance).toBe('104.99');
+    expect(wallet.credit_balance).toBe('74.63');
 
     const { rows: outflows } = await pool.query(
       `SELECT s.gross_amount, st.remittance_amount, st.fee_deducted_from_provider, s.platform_fee,

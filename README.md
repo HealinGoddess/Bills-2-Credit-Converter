@@ -69,7 +69,7 @@ The user's statements, newest first, each with `platform_fee_rate` and `platform
 ```
 Supported `mimeType`s: `image/png|jpeg|webp|tiff|bmp|gif` (Tesseract OCR), `text/plain`, `application/json` (`payeeName`, `accountNumber`, `grossAmount`, `dueDate`).
 
-Flow: validate → user must exist and be `active` → SHA-256 duplicate check → OCR → one transaction (insert the statement as a `verified` remittance asset with its fixed `platform_fee`, then `mintCreditsFromAsset` locks and credits the wallet with bill + fee, insert `CREDIT_ISSUANCE` for the bill and `FEE_CREDIT_ISSUANCE` for the fee) → save raw OCR JSON and audit log in Mongo.
+Flow: validate → user must exist and be `active` → SHA-256 duplicate check → OCR → one transaction (insert the statement as a `verified` remittance asset with its fixed `platform_fee`, then `mintCreditsFromAsset` locks the wallet, credits it dollar for dollar with the bill amount, and inserts one `CREDIT_ISSUANCE`) → save raw OCR JSON and audit log in Mongo.
 
 | Status | Code |
 | --- | --- |
@@ -99,7 +99,7 @@ debit the wallet, write `SETTLEMENT_PAYMENT` and `PLATFORM_FEE` ledger entries, 
 ## Ledger conventions
 
 - Money is handled as integer cents in JS and `NUMERIC(12,2)` in Postgres (the `pg` NUMERIC parser returns strings), so no floating-point arithmetic touches balances.
-- Example: a $100.00 bill mints $102.00 (`CREDIT_ISSUANCE` 100.00 + `FEE_CREDIT_ISSUANCE` 2.00); settling it debits 100.00 (`SETTLEMENT_PAYMENT`, paid in full to the provider) and 2.00 (`PLATFORM_FEE`), leaving the wallet where it started.
+- Example: a $100.00 bill mints $100.00 (`CREDIT_ISSUANCE`); settling it needs $102.00 and debits 100.00 (`SETTLEMENT_PAYMENT`, paid in full to the provider) and 2.00 (`PLATFORM_FEE`), so the fee must come from other credits already in the wallet. `FEE_CREDIT_ISSUANCE` rows exist only on statements ingested under the earlier bill + fee model.
 - Currency is `NOU` (Necessify Operational Unit), valued 1.00 NOU = $1.00 USD, closed-loop.
 - Ledger `amount` is signed: issuance is positive, settlement payments and fees are negative. `SUM(amount)` for a wallet equals its `credit_balance`, and `balance_after` gives a running balance.
 - Constraints added on top of the base schema: `settlements.fee_deducted_from_provider = 0.00` and one settlement per statement.

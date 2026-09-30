@@ -275,8 +275,8 @@
       const billCents = toCents(statement.gross_amount);
       const feeCents = toCents(statement.platform_fee);
       showUploadResult(true, [
-        el('strong', { text: `${money(billCents + feeCents)} in credits added to your wallet.` }),
-        el('p', { className: 'muted', text: `${money(billCents)} for the bill plus ${money(feeCents)} to cover the platform fee, so this bill can be paid in full.` }),
+        el('strong', { text: `${money(billCents)} in credits added to your wallet.` }),
+        el('p', { className: 'muted', text: `Paying this bill takes ${money(billCents + feeCents)}: ${money(billCents)} to ${statement.payee_name} plus the ${money(feeCents)} platform fee, which comes from other credits in your wallet.` }),
         el('dl', {}, [
           el('dt', { text: 'From' }), el('dd', { text: statement.payee_name }),
           el('dt', { text: 'Account' }), el('dd', { text: statement.account_number_masked }),

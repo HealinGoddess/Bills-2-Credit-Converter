@@ -89,7 +89,7 @@ describe('POST /api/v1/statements/ingest', () => {
   const text = statementText({ amount: '142.37' });
   const body = { userId: USER_ID, fileBase64: toBase64(text), mimeType: 'text/plain' };
 
-  test('mints credits for the bill plus the fixed 2% fee inside a single transaction', async () => {
+  test('mints credits dollar for dollar with the bill and records the fixed 2% fee on the statement', async () => {
     const { app, pool, documentStore } = buildApp(ingestHandler({ walletBalance: '10.00' }));
 
     const res = await post(app, '/api/v1/statements/ingest').send(body);
@@ -103,15 +103,14 @@ describe('POST /api/v1/statements/ingest', () => {
       platform_fee_rate: '0.02', platform_fee: '2.85', verification_status: 'verified',
     });
     expect(pool.find('INSERT INTO statements')[0].sql).toContain("'verified'");
-    expect(res.body.wallet).toEqual({ walletId: WALLET_ID, creditBalance: '155.22', currency: 'NOU' });
+    expect(res.body.wallet).toEqual({ walletId: WALLET_ID, creditBalance: '152.37', currency: 'NOU' });
     expect(res.body.documentStored).toBe(true);
 
     const [walletUpdate] = pool.find('UPDATE wallets SET credit_balance');
-    expect(walletUpdate.params).toEqual(['155.22', WALLET_ID]);
+    expect(walletUpdate.params).toEqual(['152.37', WALLET_ID]);
     const entries = pool.find('INSERT INTO ledger_entries').map((q) => q.params.slice(0, 5));
     expect(entries).toEqual([
       [WALLET_ID, STATEMENT_ID, 'CREDIT_ISSUANCE', '142.37', '152.37'],
-      [WALLET_ID, STATEMENT_ID, 'FEE_CREDIT_ISSUANCE', '2.85', '155.22'],
     ]);
     const [statementInsert] = pool.find('INSERT INTO statements');
     expect(statementInsert.params.slice(6)).toEqual([0.02, '2.85']);
@@ -168,7 +167,7 @@ describe('POST /api/v1/statements/ingest', () => {
     const { app, pool } = buildApp(ingestHandler());
     const res = await post(app, '/api/v1/statements/ingest').send({ ...body, platformFeeRate: 0 });
     expect(res.status).toBe(201);
-    expect(res.body.wallet.creditBalance).toBe('145.22');
+    expect(res.body.wallet.creditBalance).toBe('142.37');
     expect(pool.find('INSERT INTO statements')[0].params.slice(6)).toEqual([0.02, '2.85']);
   });
 

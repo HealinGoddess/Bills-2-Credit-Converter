@@ -7,10 +7,6 @@ const { isUuid } = require('../lib/validate');
 const DEFAULT_PLATFORM_FEE_RATE = 0.02;
 const PROVIDER_FEE = '0.00';
 
-function formatPercent(rate) {
-  return `${Number((rate * 100).toFixed(4))}%`;
-}
-
 function parsePlatformFeeRate(value) {
   if (value === undefined || value === '') return DEFAULT_PLATFORM_FEE_RATE;
   const rate = Number(value);
@@ -61,8 +57,7 @@ async function lockWallet(client, userId) {
   return rows[0];
 }
 
-// Converts a verified statement (remittance asset) into NOU credits: the bill amount
-// plus its recorded platform fee, so the statement alone can satisfy its settlement.
+// Converts a verified statement (remittance asset) into NOU credits, dollar for dollar.
 async function mintCreditsFromAsset(client, { statementId, userId }) {
   const { rows: [asset] } = await client.query(
     `SELECT statement_id, payee_name, account_number_masked, gross_amount, platform_fee_rate, platform_fee
@@ -73,10 +68,7 @@ async function mintCreditsFromAsset(client, { statementId, userId }) {
   const wallet = await lockWallet(client, userId);
 
   const grossCents = toCents(asset.gross_amount);
-  const feeCents = toCents(asset.platform_fee);
-  const startCents = toCents(wallet.credit_balance);
-  const afterIssuance = fromCents(startCents + grossCents);
-  const newBalance = fromCents(startCents + grossCents + feeCents);
+  const newBalance = fromCents(toCents(wallet.credit_balance) + grossCents);
   await client.query(
     'UPDATE wallets SET credit_balance = $1, updated_at = CURRENT_TIMESTAMP WHERE wallet_id = $2',
     [newBalance, wallet.wallet_id],
@@ -86,21 +78,13 @@ async function mintCreditsFromAsset(client, { statementId, userId }) {
      VALUES ($1, $2, $3, $4, $5, $6, clock_timestamp())
      RETURNING entry_id, entry_type, amount, balance_after, description, created_at`;
   const { rows: [ledgerEntry] } = await client.query(insertEntry, [
-    wallet.wallet_id, statementId, 'CREDIT_ISSUANCE', fromCents(grossCents), afterIssuance,
+    wallet.wallet_id, statementId, 'CREDIT_ISSUANCE', fromCents(grossCents), newBalance,
     `Credit issuance for ${asset.payee_name} statement ${asset.account_number_masked}`,
   ]);
-  const ledgerEntries = [ledgerEntry];
-  if (feeCents > 0) {
-    const { rows: [feeEntry] } = await client.query(insertEntry, [
-      wallet.wallet_id, statementId, 'FEE_CREDIT_ISSUANCE', fromCents(feeCents), newBalance,
-      `Credits to cover the ${formatPercent(Number(asset.platform_fee_rate))} platform fee for ${asset.payee_name}`,
-    ]);
-    ledgerEntries.push(feeEntry);
-  }
 
   return {
     wallet: { walletId: wallet.wallet_id, creditBalance: newBalance, currency: wallet.currency },
-    ledgerEntries,
+    ledgerEntries: [ledgerEntry],
   };
 }
 
