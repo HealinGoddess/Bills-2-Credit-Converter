@@ -18,7 +18,7 @@ const COOKIE = `${COOKIE_NAME}=${sessions.sign(USER_ID)}`;
 function buildApp(handler, { ocr = createOcrService(), documentStore = createFakeDocumentStore() } = {}) {
   const pool = createFakePool(handler);
   const app = createApp({
-    pool, ocr, documentStore, sessionSecret: SESSION_SECRET, platformFeeRate: 0.02, logger: silentLogger,
+    pool, ocr, documentStore, sessionSecret: SESSION_SECRET, logger: silentLogger,
   });
   return { app, pool, ocr, documentStore };
 }
@@ -26,27 +26,55 @@ function buildApp(handler, { ocr = createOcrService(), documentStore = createFak
 const post = (app, path) => request(app).post(path).set('Cookie', COOKIE);
 const get = (app, path) => request(app).get(path).set('Cookie', COOKIE);
 
-function ingestHandler({ duplicate = false, walletBalance = '0.00', insertError } = {}) {
-  let inserted;
+const SUBSCRIPTION_ID = crypto.randomUUID();
+const PAID_BASIC_PLAN = [{ statement_id: SUBSCRIPTION_ID, gross_amount: '75.00', verification_status: 'settled' }];
+
+function ingestHandler({
+  duplicate = false, walletBalance = '0.00', insertError, companies = 1, billed = PAID_BASIC_PLAN,
+} = {}) {
+  const rows = {};
+  let balance = walletBalance;
   return (sql, params) => {
-    if (sql.startsWith('SELECT statement_id, payee_name, account_number_masked, gross_amount, platform_fee_rate')) {
-      return { rows: inserted && params[0] === inserted.statement_id ? [inserted] : [] };
+    if (sql.startsWith('SELECT statement_id, payee_name, account_number_masked, gross_amount FROM statements')) {
+      return { rows: rows[params[0]] ? [rows[params[0]]] : [] };
     }
     if (sql.startsWith('SELECT account_status FROM users')) return { rows: [{ account_status: 'active' }] };
     if (sql.startsWith('SELECT statement_id FROM statements WHERE ocr_hash')) {
       return { rows: duplicate ? [{ statement_id: STATEMENT_ID }] : [] };
     }
     if (sql.startsWith('SELECT wallet_id, credit_balance, currency FROM wallets')) {
-      return { rows: [{ wallet_id: WALLET_ID, credit_balance: walletBalance, currency: 'NOU' }] };
+      return { rows: [{ wallet_id: WALLET_ID, credit_balance: balance, currency: 'NOU' }] };
+    }
+    if (sql.startsWith('UPDATE wallets SET credit_balance')) {
+      [balance] = params;
+      return undefined;
+    }
+    if (sql.startsWith("SELECT date_trunc('month'")) return { rows: [{ billing_month: '2026-09-01', companies }] };
+    if (sql.startsWith('SELECT statement_id, gross_amount, verification_status FROM statements')) return { rows: billed };
+    if (sql.startsWith('UPDATE statements SET gross_amount')) {
+      const current = billed.find((bill) => bill.statement_id === params[0]);
+      rows[params[0]] = {
+        statement_id: params[0], payee_name: 'Necessify Monthly Plan', account_number_masked: params[2],
+        gross_amount: (Number(current.gross_amount) + Number(params[1])).toFixed(2),
+        verification_status: 'verified', statement_type: 'PLATFORM_SUBSCRIPTION',
+      };
+      return { rows: [rows[params[0]]] };
     }
     if (sql.startsWith('INSERT INTO statements')) {
+      if (params[6] === 'PLATFORM_SUBSCRIPTION') {
+        rows[SUBSCRIPTION_ID] = {
+          statement_id: SUBSCRIPTION_ID, payee_name: params[1], account_number_masked: params[2], gross_amount: params[3],
+          verification_status: 'verified', statement_type: params[6], billing_month: params[4],
+        };
+        return { rows: [rows[SUBSCRIPTION_ID]] };
+      }
       if (insertError) throw insertError;
-      inserted = {
+      rows[STATEMENT_ID] = {
         statement_id: STATEMENT_ID, user_id: params[0], payee_name: params[1], account_number_masked: params[2],
         gross_amount: params[3], due_date: params[4], ocr_hash: params[5], verification_status: 'verified',
-        platform_fee_rate: String(params[6]), platform_fee: params[7],
+        statement_type: 'UTILITY',
       };
-      return { rows: [inserted] };
+      return { rows: [rows[STATEMENT_ID]] };
     }
     if (sql.startsWith('INSERT INTO ledger_entries')) {
       return { rows: [{ entry_type: params[2], amount: params[3], balance_after: params[4] }] };
@@ -56,21 +84,29 @@ function ingestHandler({ duplicate = false, walletBalance = '0.00', insertError 
 }
 
 function settleHandler({
-  grossAmount = '100.00', walletBalance = '500.00', status = 'pending', owner = USER_ID,
-  platformFeeRate = null, platformFee = null,
+  grossAmount = '100.00', walletBalance = '500.00', earmarked = grossAmount, status = 'verified', owner = USER_ID,
+  statementType = 'UTILITY',
 } = {}) {
+  let balance = walletBalance;
   return (sql, params) => {
     if (sql.startsWith('SELECT statement_id, user_id, payee_name, gross_amount')) {
       return {
         rows: [{
           statement_id: STATEMENT_ID, user_id: owner, payee_name: 'City Power & Light',
-          gross_amount: grossAmount, verification_status: status,
-          platform_fee_rate: platformFeeRate, platform_fee: platformFee,
+          gross_amount: grossAmount, verification_status: status, statement_type: statementType,
         }],
       };
     }
     if (sql.startsWith('SELECT wallet_id, credit_balance, currency FROM wallets')) {
-      return { rows: [{ wallet_id: WALLET_ID, credit_balance: walletBalance, currency: 'NOU' }] };
+      return { rows: [{ wallet_id: WALLET_ID, credit_balance: balance, currency: 'NOU' }] };
+    }
+    if (sql.startsWith('UPDATE wallets SET credit_balance')) {
+      [balance] = params;
+      return undefined;
+    }
+    if (sql.startsWith('SELECT COALESCE(SUM(amount), 0)')) return { rows: [{ available: earmarked }] };
+    if (sql.startsWith('INSERT INTO ledger_entries')) {
+      return { rows: [{ entry_type: params[2], amount: params[3], balance_after: params[4] }] };
     }
     if (sql.startsWith('INSERT INTO settlements')) {
       return {
@@ -89,7 +125,7 @@ describe('POST /api/v1/statements/ingest', () => {
   const text = statementText({ amount: '142.37' });
   const body = { userId: USER_ID, fileBase64: toBase64(text), mimeType: 'text/plain' };
 
-  test('mints credits dollar for dollar with the bill and records the fixed 2% fee on the statement', async () => {
+  test('mints credits dollar for dollar with the bill inside a single transaction', async () => {
     const { app, pool, documentStore } = buildApp(ingestHandler({ walletBalance: '10.00' }));
 
     const res = await post(app, '/api/v1/statements/ingest').send(body);
@@ -99,9 +135,8 @@ describe('POST /api/v1/statements/ingest', () => {
       payee_name: 'City Power & Light', account_number_masked: '****1234', gross_amount: '142.37', due_date: '2026-10-15',
     });
     expect(res.body.statement.ocr_hash).toBe(crypto.createHash('sha256').update(text).digest('hex'));
-    expect(res.body.statement).toMatchObject({
-      platform_fee_rate: '0.02', platform_fee: '2.85', verification_status: 'verified',
-    });
+    expect(res.body.statement).toMatchObject({ verification_status: 'verified', statement_type: 'UTILITY' });
+    expect(res.body.subscription).toBeNull();
     expect(pool.find('INSERT INTO statements')[0].sql).toContain("'verified'");
     expect(res.body.wallet).toEqual({ walletId: WALLET_ID, creditBalance: '152.37', currency: 'NOU' });
     expect(res.body.documentStored).toBe(true);
@@ -112,8 +147,6 @@ describe('POST /api/v1/statements/ingest', () => {
     expect(entries).toEqual([
       [WALLET_ID, STATEMENT_ID, 'CREDIT_ISSUANCE', '142.37', '152.37'],
     ]);
-    const [statementInsert] = pool.find('INSERT INTO statements');
-    expect(statementInsert.params.slice(6)).toEqual([0.02, '2.85']);
 
     const txSql = pool.client.query.mock.calls.map(([sql]) => sql.trim().split(/\s+/)[0]);
     expect(txSql[0]).toBe('BEGIN');
@@ -163,12 +196,59 @@ describe('POST /api/v1/statements/ingest', () => {
     expect(res.body.documentStored).toBe(false);
   });
 
-  test('ignores a client-supplied platformFeeRate', async () => {
-    const { app, pool } = buildApp(ingestHandler());
-    const res = await post(app, '/api/v1/statements/ingest').send({ ...body, platformFeeRate: 0 });
+  test("the month's first bill creates a $75 monthly plan bill with its own credits", async () => {
+    const { app, pool } = buildApp(ingestHandler({ walletBalance: '10.00', billed: [] }));
+
+    const res = await post(app, '/api/v1/statements/ingest').send(body);
+
     expect(res.status).toBe(201);
+    expect(res.body.subscription).toMatchObject({
+      statement_id: SUBSCRIPTION_ID, payee_name: 'Necessify Monthly Plan', gross_amount: '75.00',
+      account_number_masked: '2026-09 plan, up to 5 companies', statement_type: 'PLATFORM_SUBSCRIPTION',
+    });
+    expect(res.body.wallet.creditBalance).toBe('227.37');
+    expect(pool.find('INSERT INTO ledger_entries').map((q) => q.params.slice(1, 5))).toEqual([
+      [STATEMENT_ID, 'CREDIT_ISSUANCE', '142.37', '152.37'],
+      [SUBSCRIPTION_ID, 'CREDIT_ISSUANCE', '75.00', '227.37'],
+    ]);
+  });
+
+  test('a 6th company raises the unpaid $75 plan bill to $150', async () => {
+    const billed = [{ statement_id: SUBSCRIPTION_ID, gross_amount: '75.00', verification_status: 'verified' }];
+    const { app, pool } = buildApp(ingestHandler({ companies: 6, billed }));
+
+    const res = await post(app, '/api/v1/statements/ingest').send(body);
+
+    expect(res.status).toBe(201);
+    expect(pool.find('UPDATE statements SET gross_amount')[0].params)
+      .toEqual([SUBSCRIPTION_ID, '75.00', '2026-09 plan, more than 5 companies']);
+    expect(res.body.subscription).toMatchObject({ statement_id: SUBSCRIPTION_ID, gross_amount: '150.00' });
+    expect(pool.find('INSERT INTO statements')).toHaveLength(1);
+    expect(pool.find('INSERT INTO ledger_entries').map((q) => q.params.slice(1, 4))).toEqual([
+      [STATEMENT_ID, 'CREDIT_ISSUANCE', '142.37'],
+      [SUBSCRIPTION_ID, 'CREDIT_ISSUANCE', '75.00'],
+    ]);
+  });
+
+  test('a 6th company after the $75 plan was paid bills the extra $75 as a separate upgrade', async () => {
+    const { app, pool } = buildApp(ingestHandler({ companies: 6 }));
+
+    const res = await post(app, '/api/v1/statements/ingest').send(body);
+
+    expect(res.status).toBe(201);
+    expect(pool.find('UPDATE statements SET gross_amount')).toHaveLength(0);
+    expect(res.body.subscription).toMatchObject({
+      gross_amount: '75.00', account_number_masked: 'Upgrade: 2026-09 plan, more than 5 companies',
+    });
+  });
+
+  test('no new plan bill while the month is already billed at the right amount', async () => {
+    const { app, pool } = buildApp(ingestHandler({ companies: 5 }));
+    const res = await post(app, '/api/v1/statements/ingest').send({ ...body, platformFeeRate: 0.5 });
+    expect(res.status).toBe(201);
+    expect(res.body.subscription).toBeNull();
+    expect(pool.find('INSERT INTO statements')).toHaveLength(1);
     expect(res.body.wallet.creditBalance).toBe('142.37');
-    expect(pool.find('INSERT INTO statements')[0].params.slice(6)).toEqual([0.02, '2.85']);
   });
 
   test('uses the logged-in user, not a userId from another account', async () => {
@@ -201,7 +281,7 @@ describe('POST /api/v1/statements/ingest', () => {
 describe('POST /api/v1/payments/settle', () => {
   const body = { userId: USER_ID, statementId: STATEMENT_ID };
 
-  test('pays 100% to the provider, charges the fee to the beneficiary, and records 0.00 provider fee', async () => {
+  test("pays 100% to the provider from the bill's own credits with no fee taken", async () => {
     const { app, pool } = buildApp(settleHandler({ grossAmount: '142.37', walletBalance: '200.00' }));
 
     const res = await post(app, '/api/v1/payments/settle').send(body);
@@ -209,78 +289,64 @@ describe('POST /api/v1/payments/settle', () => {
     expect(res.status).toBe(200);
     expect(res.body.breakdown).toEqual({
       fullBillAmount: '142.37',
-      platformFeeRate: 0.02,
-      beneficiaryFee: '2.85',
-      totalCreditsDeducted: '145.22',
+      creditsDeducted: '142.37',
       providerReceives: '142.37',
       providerFee: '0.00',
       providerPayoutPercent: 100,
     });
     expect(res.body.settlement).toMatchObject({ remittance_amount: '142.37', fee_deducted_from_provider: '0.00' });
-    expect(res.body.wallet.creditBalance).toBe('54.78');
-
-    const [settlementInsert] = pool.find('INSERT INTO settlements');
-    expect(settlementInsert.params).toEqual([STATEMENT_ID, 'City Power & Light', '142.37', '0.00']);
-
-    const entries = pool.find('INSERT INTO ledger_entries').map((q) => q.params.slice(2, 5));
-    expect(entries).toEqual([
-      ['SETTLEMENT_PAYMENT', '-142.37', '57.63'],
-      ['PLATFORM_FEE', '-2.85', '54.78'],
+    expect(res.body.wallet.creditBalance).toBe('57.63');
+    expect(pool.find('INSERT INTO settlements')[0].params).toEqual([STATEMENT_ID, 'City Power & Light', '142.37', '0.00']);
+    expect(pool.find('INSERT INTO ledger_entries').map((q) => q.params.slice(1, 5))).toEqual([
+      [STATEMENT_ID, 'SETTLEMENT_PAYMENT', '-142.37', '57.63'],
     ]);
-    expect(pool.find('UPDATE wallets')[0].params[0]).toBe('54.78');
+    expect(pool.find('INSERT INTO statements')).toHaveLength(0);
     expect(pool.find("verification_status = 'settled'")).toHaveLength(1);
-    expect(pool.find('FOR UPDATE')).toHaveLength(2);
     expect(pool.find('COMMIT')).toHaveLength(1);
   });
 
+  test('paying the monthly plan bill records a PLATFORM_FEE from its own credits', async () => {
+    const { app, pool } = buildApp(settleHandler({
+      grossAmount: '75.00', walletBalance: '75.00', statementType: 'PLATFORM_SUBSCRIPTION',
+    }));
+
+    const res = await post(app, '/api/v1/payments/settle').send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body.breakdown).toMatchObject({ providerReceives: '75.00', providerFee: '0.00' });
+    expect(res.body.wallet.creditBalance).toBe('0.00');
+    expect(pool.find('INSERT INTO ledger_entries').map((q) => q.params[2])).toEqual(['PLATFORM_FEE']);
+  });
+
   test.each([0, 0.05, 0.5, -1, '0', null])(
-    'ignores client platformFeeRate %p: fee stays 2%% and provider fee stays 0.00',
+    'ignores client platformFeeRate %p: no fee at payment and provider fee stays 0.00',
     async (platformFeeRate) => {
       const { app, pool } = buildApp(settleHandler({ grossAmount: '999.99', walletBalance: '5000.00' }));
 
       const res = await post(app, '/api/v1/payments/settle').send({ ...body, platformFeeRate });
 
       expect(res.status).toBe(200);
-      expect(res.body.breakdown).toMatchObject({ platformFeeRate: 0.02, beneficiaryFee: '20.00' });
-      expect(res.body.settlement.fee_deducted_from_provider).toBe('0.00');
-      expect(res.body.breakdown.providerReceives).toBe('999.99');
+      expect(res.body.breakdown).toMatchObject({ creditsDeducted: '999.99', providerReceives: '999.99' });
+      expect(res.body.wallet.creditBalance).toBe('4000.01');
       expect(pool.find('INSERT INTO settlements')[0].params[3]).toBe('0.00');
     },
   );
 
-  test('charges the fee recorded on the statement when it was ingested', async () => {
-    const { app } = buildApp(settleHandler({
-      grossAmount: '100.00', walletBalance: '103.00', platformFeeRate: '0.030000', platformFee: '3.00',
-    }));
-    const res = await post(app, '/api/v1/payments/settle').send(body);
-    expect(res.status).toBe(200);
-    expect(res.body.breakdown).toMatchObject({ platformFeeRate: 0.03, beneficiaryFee: '3.00', providerFee: '0.00' });
-    expect(res.body.wallet.creditBalance).toBe('0.00');
-  });
-
-  test('rejects insufficient balance with 400, rolls back, and writes nothing', async () => {
-    // 100.00 bill + 2.00 fee = 102.00 required
-    const { app, pool } = buildApp(settleHandler({ grossAmount: '100.00', walletBalance: '100.00' }));
+  test("cannot use other bills' credits: rejects when this bill's own credits fall short, even with a large wallet", async () => {
+    const { app, pool } = buildApp(settleHandler({ grossAmount: '100.00', walletBalance: '900.00', earmarked: '60.00' }));
 
     const res = await post(app, '/api/v1/payments/settle').send(body);
 
     expect(res.status).toBe(400);
     expect(res.body.error).toMatchObject({
       code: 'INSUFFICIENT_CREDITS',
-      details: { required: '102.00', available: '100.00', shortfall: '2.00' },
+      details: { required: '100.00', available: '60.00', shortfall: '40.00' },
     });
     expect(pool.find('ROLLBACK')).toHaveLength(1);
     expect(pool.find('COMMIT')).toHaveLength(0);
     expect(pool.find('UPDATE wallets')).toHaveLength(0);
     expect(pool.find('INSERT INTO ledger_entries')).toHaveLength(0);
     expect(pool.find('INSERT INTO settlements')).toHaveLength(0);
-  });
-
-  test('settles when the balance exactly covers bill plus fee', async () => {
-    const { app } = buildApp(settleHandler({ grossAmount: '100.00', walletBalance: '102.00' }));
-    const res = await post(app, '/api/v1/payments/settle').send(body);
-    expect(res.status).toBe(200);
-    expect(res.body.wallet.creditBalance).toBe('0.00');
   });
 
   test('returns 409 for an already-settled statement', async () => {
@@ -460,15 +526,15 @@ describe('accounts and log-in', () => {
 });
 
 describe('statement listing', () => {
-  test("lists the user's statements newest first with the fee each one will be charged", async () => {
+  test("lists the user's statements newest first, including monthly plan bills", async () => {
     const rows = [
       {
-        statement_id: STATEMENT_ID, payee_name: 'Water Co', gross_amount: '142.37', verification_status: 'pending',
-        platform_fee_rate: '0.020000', platform_fee: '2.85',
+        statement_id: crypto.randomUUID(), payee_name: 'Necessify Monthly Plan', gross_amount: '75.00',
+        verification_status: 'verified', statement_type: 'PLATFORM_SUBSCRIPTION', billing_month: '2026-09-01',
       },
       {
-        statement_id: crypto.randomUUID(), payee_name: 'Old Bill', gross_amount: '100.00', verification_status: 'pending',
-        platform_fee_rate: null, platform_fee: null,
+        statement_id: STATEMENT_ID, payee_name: 'Water Co', gross_amount: '142.37', verification_status: 'verified',
+        statement_type: 'UTILITY', billing_month: null,
       },
     ];
     const { app, pool } = buildApp(() => ({ rows }));
@@ -476,10 +542,7 @@ describe('statement listing', () => {
     const res = await get(app, `/api/v1/users/${USER_ID}/statements`);
 
     expect(res.status).toBe(200);
-    expect(res.body.statements.map((st) => [st.platform_fee_rate, st.platform_fee])).toEqual([
-      [0.02, '2.85'],
-      [0.02, '2.00'],
-    ]);
+    expect(res.body.statements).toEqual(rows);
     const [q] = pool.find('FROM statements WHERE user_id = $1');
     expect(q.sql).toContain('ORDER BY created_at DESC');
     expect(q.params).toEqual([USER_ID]);

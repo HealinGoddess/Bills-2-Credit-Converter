@@ -26,7 +26,6 @@ beforeAll(async () => {
     ocr: createOcrService(),
     documentStore: createMongoDocumentStore(),
     sessionSecret: 'integration-test-session-secret',
-    platformFeeRate: 0.02,
   });
 });
 
@@ -42,9 +41,9 @@ async function createUser(email = `user-${crypto.randomUUID()}@example.com`) {
   return { agent, userId: res.body.user.user_id, email };
 }
 
-function ingest(agent, amount) {
+function ingest(agent, amount, payee) {
   return agent.post('/api/v1/statements/ingest').send({
-    fileBase64: toBase64(statementText({ amount })), mimeType: 'text/plain',
+    fileBase64: toBase64(statementText({ amount, payee })), mimeType: 'text/plain',
   });
 }
 
@@ -100,28 +99,33 @@ describe('accounts and log-in (Postgres)', () => {
     expect((await bob.agent.get(`/api/v1/users/${alice.userId}/statements`)).status).toBe(403);
     expect((await settle(bob.agent, statement.statement_id)).status).toBe(404);
     expect((await settle(bob.agent, statement.statement_id, { userId: alice.userId })).status).toBe(403);
-    expect((await walletOf(alice)).wallet.credit_balance).toBe('12.00');
+    expect((await walletOf(alice)).wallet.credit_balance).toBe('87.00');
   });
 });
 
 describe('Necessify ledger (Postgres + Mongo)', () => {
-  test('ingest mints credits dollar for dollar, records the 2% fee, writes the ledger, and stores the OCR document', async () => {
+  test("ingest mints credits dollar for dollar, bills the month's $75 plan, writes the ledger, and stores the OCR document", async () => {
     const user = await createUser();
 
     const res = await ingest(user.agent, '142.37');
 
     expect(res.status).toBe(201);
-    expect(res.body.wallet.creditBalance).toBe('142.37');
     expect(res.body.documentStored).toBe(true);
-    const { statement } = res.body;
+    const { statement, subscription } = res.body;
     expect(statement).toMatchObject({
-      gross_amount: '142.37', verification_status: 'verified', due_date: '2026-10-15',
-      platform_fee_rate: '0.020000', platform_fee: '2.85',
+      gross_amount: '142.37', verification_status: 'verified', due_date: '2026-10-15', statement_type: 'UTILITY',
     });
+    expect(subscription).toMatchObject({
+      payee_name: 'Necessify Monthly Plan', gross_amount: '75.00', verification_status: 'verified',
+      statement_type: 'PLATFORM_SUBSCRIPTION',
+    });
+    expect(subscription.account_number_masked).toMatch(/^\d{4}-\d{2} plan, up to 5 companies$/);
+    expect(res.body.wallet.creditBalance).toBe('217.37');
 
     const { wallet, ledgerEntries } = await walletOf(user);
-    expect(wallet.credit_balance).toBe('142.37');
+    expect(wallet.credit_balance).toBe('217.37');
     expect(ledgerEntries.map((e) => [e.entry_type, e.amount, e.balance_after])).toEqual([
+      ['CREDIT_ISSUANCE', '75.00', '217.37'],
       ['CREDIT_ISSUANCE', '142.37', '142.37'],
     ]);
 
@@ -144,7 +148,7 @@ describe('Necessify ledger (Postgres + Mongo)', () => {
     expect(again.status).toBe(400);
     expect(again.body.error.code).toBe('DUPLICATE_STATEMENT');
     expect(otherUser.status).toBe(400);
-    expect((await walletOf(user)).wallet.credit_balance).toBe('75.00');
+    expect((await walletOf(user)).wallet.credit_balance).toBe('150.00');
     expect((await walletOf(other)).wallet.credit_balance).toBe('0.00');
   });
 
@@ -158,92 +162,131 @@ describe('Necessify ledger (Postgres + Mongo)', () => {
 
     expect(results.filter((r) => r.status === 201)).toHaveLength(1);
     expect(results.filter((r) => r.status === 400)).toHaveLength(4);
-    expect((await walletOf(user)).wallet.credit_balance).toBe('20.00');
+    expect((await walletOf(user)).wallet.credit_balance).toBe('95.00');
   });
 
-  test('a single $150 bill alone cannot cover its $3 fee', async () => {
+  test('the plan is billed once a month: $75 for up to 5 companies, raised to $150 at the 6th', async () => {
     const user = await createUser();
-    const { body: { statement, wallet } } = await ingest(user.agent, '150.00');
-    expect(wallet.creditBalance).toBe('150.00');
+    const payees = ['Light Co', 'Water Co', 'Gas Co', 'Internet Co', 'Landlord LLC'];
+    const first = await ingest(user.agent, '10.00', payees[0]);
+    const planId = first.body.subscription.statement_id;
+    for (const payee of [...payees.slice(1), ' light co ']) {
+      const res = await ingest(user.agent, '10.00', payee);
+      expect(res.status).toBe(201);
+      expect(res.body.subscription).toBeNull();
+    }
 
-    const res = await settle(user.agent, statement.statement_id);
+    const sixth = await ingest(user.agent, '10.00', 'Phone Co');
+    expect(sixth.body.subscription).toMatchObject({ statement_id: planId, gross_amount: '150.00' });
+    expect(sixth.body.subscription.account_number_masked).toMatch(/more than 5 companies$/);
+    expect((await ingest(user.agent, '10.00', 'Trash Co')).body.subscription).toBeNull();
+    expect((await walletOf(user)).wallet.credit_balance).toBe('230.00');
 
-    expect(res.status).toBe(400);
-    expect(res.body.error).toMatchObject({ code: 'INSUFFICIENT_CREDITS', details: { required: '153.00', shortfall: '3.00' } });
+    const paid = await settle(user.agent, planId);
+    expect(paid.status).toBe(200);
+    expect(paid.body.breakdown.providerReceives).toBe('150.00');
+    expect(paid.body.wallet.creditBalance).toBe('80.00');
   });
 
-  test('settling pays the provider 100% and takes the fee from existing wallet credits', async () => {
+  test('a 6th company after the $75 plan was paid bills the extra $75 as its own upgrade bill', async () => {
     const user = await createUser();
-    await addExistingCredits(user.userId, '10.00');
-    const { body: { statement } } = await ingest(user.agent, '142.37');
+    const first = await ingest(user.agent, '10.00', 'Co 1');
+    expect((await settle(user.agent, first.body.subscription.statement_id)).status).toBe(200);
+    for (let i = 2; i <= 5; i += 1) await ingest(user.agent, '10.00', `Co ${i}`);
 
-    const res = await settle(user.agent, statement.statement_id);
+    const sixth = await ingest(user.agent, '10.00', 'Co 6');
 
-    expect(res.status).toBe(200);
-    expect(res.body.breakdown).toMatchObject({
-      fullBillAmount: '142.37', platformFeeRate: 0.02, beneficiaryFee: '2.85', totalCreditsDeducted: '145.22',
-      providerReceives: '142.37', providerFee: '0.00', providerPayoutPercent: 100,
-    });
-    expect(res.body.wallet.creditBalance).toBe('7.15');
-
-    const { rows: [settlement] } = await pool.query(
-      'SELECT remittance_amount, fee_deducted_from_provider, payment_channel, disbursement_status FROM settlements WHERE statement_id = $1',
-      [statement.statement_id],
+    expect(sixth.body.subscription.statement_id).not.toBe(first.body.subscription.statement_id);
+    expect(sixth.body.subscription).toMatchObject({ gross_amount: '75.00', verification_status: 'verified' });
+    expect(sixth.body.subscription.account_number_masked).toMatch(/^Upgrade: .* more than 5 companies$/);
+    expect((await settle(user.agent, sixth.body.subscription.statement_id)).status).toBe(200);
+    const { rows: [billed] } = await pool.query(
+      `SELECT sum(gross_amount)::text AS total FROM statements WHERE user_id = $1 AND statement_type = 'PLATFORM_SUBSCRIPTION'`,
+      [user.userId],
     );
-    expect(settlement).toEqual({
-      remittance_amount: '142.37', fee_deducted_from_provider: '0.00', payment_channel: 'ACH_DIRECT', disbursement_status: 'completed',
-    });
+    expect(billed.total).toBe('150.00');
+  });
 
-    const { wallet, ledgerEntries } = await walletOf(user);
-    expect(wallet.credit_balance).toBe('7.15');
+  test('a $150 bill pays its provider in full from its own credits; the monthly plan is paid separately from its own credits', async () => {
+    const user = await createUser();
+    const { body: { statement, subscription, wallet } } = await ingest(user.agent, '150.00');
+    expect(wallet.creditBalance).toBe('225.00');
+
+    const paid = await settle(user.agent, statement.statement_id);
+    expect(paid.status).toBe(200);
+    expect(paid.body.breakdown).toEqual({
+      fullBillAmount: '150.00', creditsDeducted: '150.00', providerReceives: '150.00', providerFee: '0.00',
+      providerPayoutPercent: 100,
+    });
+    expect(paid.body.wallet.creditBalance).toBe('75.00');
+
+    const fee = await settle(user.agent, subscription.statement_id);
+    expect(fee.status).toBe(200);
+    expect(fee.body.wallet.creditBalance).toBe('0.00');
+    expect((await settle(user.agent, subscription.statement_id)).status).toBe(409);
+
+    const { ledgerEntries } = await walletOf(user);
     expect(ledgerEntries.map((e) => [e.entry_type, e.amount, e.balance_after])).toEqual([
-      ['PLATFORM_FEE', '-2.85', '7.15'],
-      ['SETTLEMENT_PAYMENT', '-142.37', '10.00'],
-      ['CREDIT_ISSUANCE', '142.37', '152.37'],
+      ['PLATFORM_FEE', '-75.00', '0.00'],
+      ['SETTLEMENT_PAYMENT', '-150.00', '75.00'],
+      ['CREDIT_ISSUANCE', '75.00', '225.00'],
+      ['CREDIT_ISSUANCE', '150.00', '150.00'],
     ]);
 
-    const { rows: [s] } = await pool.query('SELECT verification_status FROM statements WHERE statement_id = $1', [statement.statement_id]);
-    expect(s.verification_status).toBe('settled');
+    const { rows: settlements } = await pool.query(
+      `SELECT st.payee_name, st.remittance_amount, st.fee_deducted_from_provider, st.payment_channel, st.disbursement_status
+       FROM settlements st JOIN statements s USING (statement_id) WHERE s.user_id = $1 ORDER BY st.remittance_amount DESC`,
+      [user.userId],
+    );
+    expect(settlements).toEqual([
+      { payee_name: 'City Power & Light', remittance_amount: '150.00', fee_deducted_from_provider: '0.00', payment_channel: 'ACH_DIRECT', disbursement_status: 'completed' },
+      { payee_name: 'Necessify Monthly Plan', remittance_amount: '75.00', fee_deducted_from_provider: '0.00', payment_channel: 'ACH_DIRECT', disbursement_status: 'completed' },
+    ]);
+    const { rows } = await pool.query('SELECT verification_status FROM statements WHERE user_id = $1', [user.userId]);
+    expect(rows.map((r) => r.verification_status)).toEqual(['settled', 'settled']);
     expect(await AuditLog.countDocuments({ statementId: statement.statement_id, event: 'STATEMENT_SETTLED' })).toBe(1);
   });
 
-  test('a client cannot lower or remove the fee', async () => {
+  test("one bill's credits cannot pay another bill", async () => {
     const user = await createUser();
-    await addExistingCredits(user.userId, '5.00');
-    const { body: { statement } } = await ingest(user.agent, '100.00');
+    await ingest(user.agent, '100.00');
+    const { rows: [water] } = await pool.query(
+      `INSERT INTO statements (user_id, payee_name, account_number_masked, gross_amount, due_date, ocr_hash, verification_status)
+       VALUES ($1, 'Water Co', '****9999', 80.00, '2026-11-01', $2, 'verified') RETURNING statement_id`,
+      [user.userId, crypto.randomUUID().replace(/-/g, '')],
+    );
 
-    const res = await settle(user.agent, statement.statement_id, { platformFeeRate: 0 });
-
-    expect(res.status).toBe(200);
-    expect(res.body.breakdown).toMatchObject({ platformFeeRate: 0.02, beneficiaryFee: '2.00', providerFee: '0.00' });
-    expect(res.body.wallet.creditBalance).toBe('3.00');
-  });
-
-  test('settlement with insufficient credits is rejected and leaves no trace', async () => {
-    const user = await createUser();
-    const { body: { statement } } = await ingest(user.agent, '100.00');
-    await pool.query('UPDATE wallets SET credit_balance = 50.00 WHERE user_id = $1', [user.userId]);
-
-    const res = await settle(user.agent, statement.statement_id);
+    const res = await settle(user.agent, water.statement_id);
 
     expect(res.status).toBe(400);
-    expect(res.body.error).toMatchObject({ code: 'INSUFFICIENT_CREDITS', details: { shortfall: '52.00' } });
-    const { rows } = await pool.query('SELECT count(*)::int AS n FROM settlements WHERE statement_id = $1', [statement.statement_id]);
+    expect(res.body.error).toMatchObject({
+      code: 'INSUFFICIENT_CREDITS', details: { required: '80.00', available: '0.00', shortfall: '80.00' },
+    });
+    const { rows } = await pool.query('SELECT count(*)::int AS n FROM settlements WHERE statement_id = $1', [water.statement_id]);
     expect(rows[0].n).toBe(0);
-    const { rows: [s] } = await pool.query('SELECT verification_status FROM statements WHERE statement_id = $1', [statement.statement_id]);
-    expect(s.verification_status).toBe('verified');
+    expect((await walletOf(user)).wallet.credit_balance).toBe('175.00');
   });
 
-  test('concurrent settle requests settle once and never overdraw', async () => {
+  test('a client cannot add a fee at payment time', async () => {
     const user = await createUser();
-    await addExistingCredits(user.userId, '7.00');
+    const { body: { statement } } = await ingest(user.agent, '100.00');
+
+    const res = await settle(user.agent, statement.statement_id, { platformFeeRate: 0.5 });
+
+    expect(res.status).toBe(200);
+    expect(res.body.breakdown).toMatchObject({ creditsDeducted: '100.00', providerReceives: '100.00', providerFee: '0.00' });
+    expect(res.body.wallet.creditBalance).toBe('75.00');
+  });
+
+  test('concurrent settle requests settle exactly once', async () => {
+    const user = await createUser();
     const { body: { statement } } = await ingest(user.agent, '50.00');
 
     const results = await Promise.all(Array.from({ length: 4 }, () => settle(user.agent, statement.statement_id)));
 
     expect(results.filter((r) => r.status === 200)).toHaveLength(1);
     expect(results.filter((r) => r.status === 409)).toHaveLength(3);
-    expect((await walletOf(user)).wallet.credit_balance).toBe('6.00');
+    expect((await walletOf(user)).wallet.credit_balance).toBe('75.00');
   });
 
   test('the database itself refuses any settlement with a nonzero provider fee', async () => {
@@ -257,18 +300,21 @@ describe('Necessify ledger (Postgres + Mongo)', () => {
     )).rejects.toMatchObject({ code: '23514', constraint: 'settlements_zero_provider_fee' });
   });
 
-  test('users list their statements with current status and fee', async () => {
+  test('users list their statements, including the monthly plan bill', async () => {
     const user = await createUser();
     const { body: { statement: paid } } = await ingest(user.agent, '40.00');
-    await ingest(user.agent, '5.00');
+    await ingest(user.agent, '5.00', 'Water Co');
     expect((await settle(user.agent, paid.statement_id)).status).toBe(200);
 
     const res = await user.agent.get(`/api/v1/users/${user.userId}/statements`);
     expect(res.status).toBe(200);
-    expect(res.body.statements.map((s) => [s.gross_amount, s.platform_fee, s.verification_status])).toEqual([
-      ['5.00', '0.10', 'verified'], ['40.00', '0.80', 'settled'],
+    expect(res.body.statements.map((s) => [s.statement_type, s.payee_name, s.gross_amount, s.verification_status])).toEqual([
+      ['UTILITY', 'Water Co', '5.00', 'verified'],
+      ['PLATFORM_SUBSCRIPTION', 'Necessify Monthly Plan', '75.00', 'verified'],
+      ['UTILITY', 'City Power & Light', '40.00', 'settled'],
     ]);
-    expect((await walletOf(user)).wallet.credit_balance).toBe('4.20');
+    expect(res.body.statements[1].billing_month).toMatch(/^\d{4}-\d{2}-01$/);
+    expect((await walletOf(user)).wallet.credit_balance).toBe('80.00');
   });
 
   test('ledger invariants hold across many bills: wallet = sum of entries, provider gets gross, fee only from wallet', async () => {
@@ -281,12 +327,14 @@ describe('Necessify ledger (Postgres + Mongo)', () => {
     );
     const amounts = ['150.00', '0.01', '33.33', '1234.56', '99.99'];
     const statements = [];
+    let plan;
     for (const amount of amounts) {
       const res = await ingest(user.agent, amount);
       expect(res.status).toBe(201);
       statements.push(res.body.statement);
+      plan ??= res.body.subscription;
     }
-    for (const st of statements.slice(0, 4)) {
+    for (const st of [...statements.slice(0, 4), plan]) {
       expect((await settle(user.agent, st.statement_id)).status).toBe(200);
     }
 
@@ -295,20 +343,21 @@ describe('Necessify ledger (Postgres + Mongo)', () => {
       'SELECT sum(amount)::numeric(12,2)::text AS total FROM ledger_entries WHERE wallet_id = $1', [wallet.wallet_id],
     );
     expect(sum.total).toBe(wallet.credit_balance);
-    expect(wallet.credit_balance).toBe('74.63');
+    expect(wallet.credit_balance).toBe('102.99');
 
     const { rows: outflows } = await pool.query(
-      `SELECT s.gross_amount, st.remittance_amount, st.fee_deducted_from_provider, s.platform_fee,
-              (SELECT -sum(amount) FROM ledger_entries l WHERE l.statement_id = s.statement_id
-                 AND l.entry_type = 'PLATFORM_FEE')::numeric(12,2)::text AS fee_debited
+      `SELECT s.statement_type, s.gross_amount, st.remittance_amount, st.fee_deducted_from_provider,
+              (SELECT sum(amount) FROM ledger_entries l WHERE l.statement_id = s.statement_id)::numeric(12,2)::text AS left_on_statement,
+              (SELECT count(*) FROM ledger_entries l WHERE l.statement_id = s.statement_id AND l.entry_type = 'PLATFORM_FEE')::int AS fee_rows
        FROM settlements st JOIN statements s USING (statement_id) WHERE s.user_id = $1`,
       [user.userId],
     );
-    expect(outflows).toHaveLength(4);
+    expect(outflows).toHaveLength(5);
     for (const row of outflows) {
       expect(row.remittance_amount).toBe(row.gross_amount);
       expect(row.fee_deducted_from_provider).toBe('0.00');
-      expect(row.fee_debited).toBe(row.platform_fee);
+      expect(row.left_on_statement).toBe('0.00');
+      expect(row.fee_rows).toBe(row.statement_type === 'PLATFORM_SUBSCRIPTION' ? 1 : 0);
     }
   });
 

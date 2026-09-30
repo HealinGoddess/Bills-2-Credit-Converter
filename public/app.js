@@ -1,5 +1,6 @@
 (() => {
   const API = '/api/v1';
+  const PLAN_TEXT = '$75 a month for up to 5 companies, $150 for more than 5';
   const MAX_FILE_BYTES = 10 * 1024 * 1024;
 
   const $ = (id) => document.getElementById(id);
@@ -70,8 +71,9 @@
       case 'DUPLICATE_STATEMENT':
         return 'This bill has already been uploaded.';
       case 'INSUFFICIENT_CREDITS':
-        return `Not enough credits. This payment needs ${money(toCents(err.details.required))}, `
-          + `you have ${money(toCents(err.details.available))} (short by ${money(toCents(err.details.shortfall))}).`;
+        return `This bill's own credits don't cover it. It needs ${money(toCents(err.details.required))}, `
+          + `it has ${money(toCents(err.details.available))} (short by ${money(toCents(err.details.shortfall))}). `
+          + 'Credits from other bills can\'t be used.';
       case 'OCR_EXTRACTION_FAILED': {
         const names = {
           payeeName: 'who the bill is from', accountNumberMasked: 'the account number', grossAmount: 'the amount due', dueDate: 'the due date',
@@ -132,7 +134,7 @@
       CREDIT_ISSUANCE: 'Bill credits added',
       FEE_CREDIT_ISSUANCE: 'Fee credits added',
       SETTLEMENT_PAYMENT: 'Bill paid',
-      PLATFORM_FEE: 'Platform fee',
+      PLATFORM_FEE: 'Monthly plan paid',
     };
     entries.forEach((entry) => {
       const cents = toCents(entry.amount);
@@ -146,11 +148,10 @@
     });
   }
 
-  function paymentBreakdown(statement) {
-    const billCents = toCents(statement.gross_amount);
-    const feeCents = toCents(statement.platform_fee);
-    const feePercent = Number((Number(statement.platform_fee_rate) * 100).toFixed(4));
-    return { billCents, feeCents, feePercent, totalCents: billCents + feeCents };
+  const isSubscription = (statement) => statement.statement_type === 'PLATFORM_SUBSCRIPTION';
+
+  function monthName(isoDate) {
+    return new Date(`${isoDate}T00:00:00Z`).toLocaleDateString(undefined, { month: 'long', year: 'numeric', timeZone: 'UTC' });
   }
 
   function renderBills(statements) {
@@ -167,7 +168,12 @@
       item.append(el('div', { className: 'bill-row' }, [
         el('div', {}, [
           el('div', { className: 'bill-title', text: statement.payee_name }),
-          el('div', { className: 'bill-meta', text: `Account ${statement.account_number_masked} · Due ${formatDate(statement.due_date)}` }),
+          el('div', {
+            className: 'bill-meta',
+            text: isSubscription(statement)
+              ? `${statement.account_number_masked} · Due ${formatDate(statement.due_date)}`
+              : `Account ${statement.account_number_masked} · Due ${formatDate(statement.due_date)}`,
+          }),
         ]),
         el('div', { className: 'bill-actions' }, [
           el('span', { className: 'bill-amount', text: money(toCents(statement.gross_amount)) }),
@@ -188,15 +194,15 @@
   }
 
   function renderConfirm(statement, message, onCancel) {
-    const { billCents, feeCents, feePercent, totalCents } = paymentBreakdown(statement);
-    const confirmButton = el('button', { className: 'primary', type: 'button', text: `Pay ${money(totalCents)}` });
+    const billCents = toCents(statement.gross_amount);
+    const confirmButton = el('button', { className: 'primary', type: 'button', text: `Pay ${money(billCents)}` });
     const cancelButton = el('button', { className: 'secondary', type: 'button', text: 'Cancel' });
+    const rows = isSubscription(statement)
+      ? [el('tr', {}, [el('td', { text: `Necessify monthly plan for ${monthName(statement.billing_month)}` }), el('td', { className: 'num', text: money(billCents) })])]
+      : [el('tr', {}, [el('td', { text: `${statement.payee_name} receives (100%, $0 fee to them)` }), el('td', { className: 'num', text: money(billCents) })])];
+    rows.push(el('tr', { className: 'total' }, [el('td', { text: "Paid from this bill's own credits" }), el('td', { className: 'num', text: money(billCents) })]));
     const panel = el('div', { className: 'confirm' }, [
-      el('table', {}, [
-        el('tr', {}, [el('td', { text: `${statement.payee_name} receives (100%, $0 fee to them)` }), el('td', { className: 'num', text: money(billCents) })]),
-        el('tr', {}, [el('td', { text: `Necessify platform fee (${feePercent}%)` }), el('td', { className: 'num', text: money(feeCents) })]),
-        el('tr', { className: 'total' }, [el('td', { text: 'Total from your wallet' }), el('td', { className: 'num', text: money(totalCents) })]),
-      ]),
+      el('table', {}, rows),
       el('div', { className: 'buttons' }, [confirmButton, cancelButton]),
     ]);
 
@@ -268,15 +274,18 @@
     $('upload-result').replaceChildren();
     try {
       const fileBase64 = await readFileAsBase64(file);
-      const { statement, wallet } = await api('/statements/ingest', {
+      const { statement, subscription, wallet } = await api('/statements/ingest', {
         method: 'POST',
         body: JSON.stringify({ fileBase64, mimeType: mimeTypeFor(file) }),
       });
       const billCents = toCents(statement.gross_amount);
-      const feeCents = toCents(statement.platform_fee);
       showUploadResult(true, [
-        el('strong', { text: `${money(billCents)} in credits added to your wallet.` }),
-        el('p', { className: 'muted', text: `Paying this bill takes ${money(billCents + feeCents)}: ${money(billCents)} to ${statement.payee_name} plus the ${money(feeCents)} platform fee, which comes from other credits in your wallet.` }),
+        el('strong', { text: `${money(billCents)} in credits added for this bill.` }),
+        el('p', { className: 'muted', text: `These credits can only pay this bill, and ${statement.payee_name} gets the full ${money(billCents)} with no fee.` }),
+        ...(subscription ? [el('p', {
+          className: 'muted',
+          text: `Your Necessify monthly plan for ${monthName(subscription.billing_month)} is now ${money(toCents(subscription.gross_amount))} (${PLAN_TEXT}). It's in your bills with its own credits.`,
+        })] : []),
         el('dl', {}, [
           el('dt', { text: 'From' }), el('dd', { text: statement.payee_name }),
           el('dt', { text: 'Account' }), el('dd', { text: statement.account_number_masked }),

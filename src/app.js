@@ -4,18 +4,17 @@ const authRouter = require('./routes/auth');
 const statementsRouter = require('./routes/statements');
 const paymentsRouter = require('./routes/payments');
 const usersRouter = require('./routes/users');
-const { createLedgerService, parsePlatformFeeRate } = require('./services/ledger');
+const { createLedgerService } = require('./services/ledger');
 const { createUserService } = require('./services/users');
 const { createSessionManager } = require('./lib/session');
 const { requireAuth } = require('./middleware/auth');
 const { notFound, createErrorHandler } = require('./middleware/errorHandler');
 
 function createApp({
-  pool, ocr, documentStore, sessionSecret, secureCookies = false,
-  platformFeeRate = parsePlatformFeeRate(process.env.PLATFORM_FEE_RATE), logger = console,
+  pool, ocr, documentStore, sessionSecret, secureCookies = false, logger = console,
 }) {
-  const ledgerService = createLedgerService({ pool, ocr, documentStore, platformFeeRate, logger });
-  const userService = createUserService({ pool, platformFeeRate });
+  const ledgerService = createLedgerService({ pool, ocr, documentStore, logger });
+  const userService = createUserService({ pool });
   const sessions = createSessionManager({ secret: sessionSecret, secureCookies });
   const authenticated = requireAuth(sessions);
 

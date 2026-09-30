@@ -2,7 +2,6 @@ const { withTransaction } = require('../../db/postgres');
 const { ApiError } = require('../lib/errors');
 const { isUuid } = require('../lib/validate');
 const { hashPassword, verifyPassword, isAcceptablePassword, MIN_PASSWORD_LENGTH } = require('../lib/password');
-const { resolvePlatformFee } = require('./ledger');
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const USER_COLUMNS = 'user_id, email, account_status, created_at';
@@ -13,7 +12,7 @@ function assertEmail(email) {
   }
 }
 
-function createUserService({ pool, platformFeeRate }) {
+function createUserService({ pool }) {
   let dummyHash;
 
   async function createUser({ email, password }) {
@@ -88,16 +87,11 @@ function createUserService({ pool, platformFeeRate }) {
     if (!isUuid(userId)) throw new ApiError(400, 'VALIDATION_ERROR', 'userId must be a UUID');
     const { rows } = await pool.query(
       `SELECT statement_id, payee_name, account_number_masked, gross_amount, due_date::text AS due_date,
-              verification_status, platform_fee_rate, platform_fee, created_at
+              verification_status, statement_type, billing_month::text AS billing_month, created_at
        FROM statements WHERE user_id = $1 ORDER BY created_at DESC`,
       [userId],
     );
-    return {
-      statements: rows.map((row) => {
-        const fee = resolvePlatformFee(row, platformFeeRate);
-        return { ...row, platform_fee_rate: fee.rate, platform_fee: fee.amount };
-      }),
-    };
+    return { statements: rows };
   }
 
   return { createUser, authenticate, getUser, getWallet, listStatements };
