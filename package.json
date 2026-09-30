@@ -1,0 +1,45 @@
+{
+  "name": "necessify-backend",
+  "version": "1.0.0",
+  "description": "Necessify cooperative payment platform: statement ingestion, wallet credit ledger, and zero-fee provider settlement API",
+  "main": "src/server.js",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "jest --selectProjects unit",
+    "test:integration": "node --experimental-vm-modules node_modules/jest/bin/jest.js --selectProjects integration --runInBand",
+    "test:all": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand"
+  },
+  "jest": {
+    "projects": [
+      {
+        "displayName": "unit",
+        "testEnvironment": "node",
+        "testMatch": [
+          "<rootDir>/tests/unit/**/*.test.js"
+        ]
+      },
+      {
+        "displayName": "integration",
+        "testEnvironment": "node",
+        "testMatch": [
+          "<rootDir>/tests/integration/**/*.test.js"
+        ]
+      }
+    ]
+  },
+  "dependencies": {
+    "dotenv": "18.0.1",
+    "express": "5.2.1",
+    "mongoose": "9.10.1",
+    "pg": "8.23.0",
+    "tesseract.js": "7.0.0"
+  },
+  "devDependencies": {
+    "jest": "30.5.1",
+    "supertest": "7.3.0"
+  }
+}
