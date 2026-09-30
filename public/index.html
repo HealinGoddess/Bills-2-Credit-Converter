@@ -4,11 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Necessify</title>
+  <link rel="icon" href="emblem.png">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">Necessify</div>
+    <div class="brand"><img src="emblem.png" alt="" class="brand-mark">Necessify</div>
     <div id="account" class="account" hidden>
       <span id="account-email"></span>
       <button id="sign-out" class="link-button" type="button">Sign out</button>
@@ -17,6 +18,7 @@
 
   <main>
     <section id="sign-in" class="card narrow" hidden>
+      <img src="logo.jpg" alt="Necessify logo" class="hero-logo">
       <h1>Pay your bills with Necessify</h1>
       <p class="muted">Upload a utility or housing bill, get matching credits, and pay the provider in full. Providers never pay a fee.</p>
       <form id="sign-in-form">
@@ -57,10 +59,12 @@
       <div class="card">
         <h2>Activity</h2>
         <p id="activity-empty" class="muted">No activity yet.</p>
-        <table id="activity" class="activity" hidden>
-          <thead><tr><th>Date</th><th>Type</th><th>Details</th><th class="num">Amount</th><th class="num">Balance</th></tr></thead>
-          <tbody></tbody>
-        </table>
+        <div class="table-scroll">
+          <table id="activity" class="activity" hidden>
+            <thead><tr><th>Date</th><th>Type</th><th>Details</th><th class="num">Amount</th><th class="num">Balance</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
       </div>
     </section>
   </main>
